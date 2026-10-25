@@ -9,7 +9,8 @@ from typing import Callable, Optional
 from .cf_session import CFSession
 from .downloader import download_sku_images
 from .http_client import HttpClient
-from .parser import parse_detail, parse_listing_cards, parse_seller_username, parse_link_kind, parse_listing_id_from_url
+from .parser import (parse_detail, parse_listing_cards, parse_seller_username,
+                     parse_link_kind, parse_listing_id_from_url, extract_seller_from_detail)
 from .rules import infer_brand, infer_gender
 from .storage import ExcelStore, FilterStore, StateStore
 
@@ -20,13 +21,15 @@ class CollectorEngine:
     def __init__(self, root: str, log: Callable[[str], None] = print,
                  progress: Callable[[int, int, str], None] = lambda c, t, m: None,
                  proxy: str = "", min_delay: float = 0.6, max_delay: float = 1.6,
-                 img_workers: int = 4, detail_concurrency: int = 2):
+                 img_workers: int = 4, detail_concurrency: int = 2, max_items: int = 5000):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "logs").mkdir(exist_ok=True)
         self.log = log
         self.progress = progress
         self.stop_event = threading.Event()
+        self.proxy = proxy
+        self.max_items = max_items
 
         self.state = StateStore(str(self.root / "state.json"))
         self.filters = FilterStore(str(self.root / "filters.json"))
@@ -74,51 +77,78 @@ class CollectorEngine:
     # ---------------- collection ----------------
 
     def collect(self, urls: list[str]) -> dict:
-        """主入口：采集多个卖家链接。"""
+        """主入口：采集多个链接（卖家主页 / 单商品均转入卖家全量）。"""
         t0 = time.time()
+        self.stats = {"new": 0, "skipped": 0, "failed": 0, "images": 0}
+        self.stop_event.clear()
         self.log("=" * 60)
         self.log(f"[开始] 共 {len(urls)} 个链接，根目录: {self.root}")
         self.log(f"[过滤] 类目跳过: {'开' if self.filters.enabled else '关'}，规则: {self.filters.categories()}")
 
-        if not self.ensure_session():
+        # ---- 1. 浏览器会话：过 CF + 枚举全部商品 + 导出 cookie ----
+        from .browser import BrowserSession
+
+        enum_sellers: dict[str, list[dict]] = {}
+        try:
+            bs = BrowserSession(str(self.root / ".cf-profile"), log=self.log, proxy=self.proxy)
+            res = bs.collect_sellers(urls, max_items=self.max_items,
+                                     log_progress=lambda c, t, m: self.progress(c, t, f"枚举 {m}"))
+            enum_sellers = res.get("sellers", {})
+            if bs.cookies:
+                self.cf.cookies = bs.cookies
+                self.cf.user_agent = bs.user_agent or self.cf.user_agent
+                self.cf.save(str(self.root / ".cf-session.json"))
+                self.log(f"[会话] 已用浏览器 cookie 更新会话（{len(bs.cookies)} 个）")
+        except Exception as e:
+            self.log(f"[浏览器] 枚举失败: {e}")
+
+        # ---- 2. 建立 HTTP 会话 ----
+        if self.cf.cookies:
+            self.client = HttpClient(self.cf, log=self.log,
+                                     min_delay=self.min_delay, max_delay=self.max_delay)
+        elif not self.ensure_session():
             self.log("[错误] CF 会话建立失败，退出")
             return self.stats
 
+        # ---- 3. 逐卖家采集 ----
         pending_excel: list[dict] = []
-        for i, url in enumerate(urls, 1):
-            if self._stopped():
-                self.log("[中止] 用户停止")
-                break
-            kind = parse_link_kind(url)
-            self.log("-" * 60)
-            try:
+        if enum_sellers:
+            for i, (seller, items) in enumerate(enum_sellers.items(), 1):
+                if self._stopped():
+                    self.log("[中止] 用户停止")
+                    break
+                self.log("-" * 60)
+                self.log(f"[卖家 {i}/{len(enum_sellers)}] {seller}（枚举到 {len(items)} 个商品）")
+                try:
+                    self._collect_seller_items(seller, items, pending_excel)
+                except Exception as e:
+                    self.log(f"[错误] {seller} 采集失败: {e}")
+                    traceback.print_exc()
+        else:
+            # 兜底：浏览器不可用 → SSR 列表（每卖家首屏 20 个）
+            self.log("[回退] 使用 SSR 列表模式（每卖家最多首屏商品）")
+            for i, url in enumerate(urls, 1):
+                if self._stopped():
+                    break
+                kind = parse_link_kind(url)
                 if kind == "seller":
                     seller = parse_seller_username(url) or url
-                    self.log(f"[链接 {i}/{len(urls)}] 卖家主页: {seller}")
-                    self._collect_seller(seller, url, pending_excel)
                 elif kind == "listing":
                     lid = parse_listing_id_from_url(url)
-                    self.log(f"[链接 {i}/{len(urls)}] 单商品链接: {lid or url[:60]}")
-                    if not lid:
-                        self.log("[错误] 无法从链接提取商品 ID")
-                        continue
-                    # 断点去重（与主页采集共用 state）
-                    if self.state.status(lid) == "done":
-                        self.log(f"[增量] {lid} 已完成，跳过")
-                        continue
-                    self.progress(1, 1, lid)
-                    try:
-                        self._collect_sku(lid, {"listing_id": lid, "url": url.split("?")[0],
-                                                 "title": "", "price": None}, "", pending_excel)
-                    except Exception as e:
-                        self.log(f"[SKU] {lid} 采集失败: {e}")
-                        self.state.record(lid, "failed", error=str(e)[:200])
-                        self.stats["failed"] += 1
+                    if lid:
+                        try:
+                            self._collect_single(lid, url.split("?")[0], pending_excel)
+                        except Exception as e:
+                            self.log(f"[SKU] {lid} 采集失败: {e}")
+                    continue
                 else:
-                    self.log(f"[链接 {i}/{len(urls)}] 不支持的链接格式（需 /u/ 主页或 /p/ 商品）: {url[:60]}")
-            except Exception as e:
-                self.log(f"[错误] 链接采集失败: {e}")
-                traceback.print_exc()
+                    continue
+                self.log("-" * 60)
+                self.log(f"[卖家 {i}/{len(urls)}] {seller}（SSR 模式）")
+                try:
+                    self._collect_seller(seller, url, pending_excel)
+                except Exception as e:
+                    self.log(f"[错误] 链接采集失败: {e}")
 
         if pending_excel and not self._stopped():
             self.excel.append(pending_excel)
@@ -128,6 +158,60 @@ class CollectorEngine:
                  f" | 图片 {self.stats['images']} 张 | 耗时 {time.time()-t0:.0f}s")
         self.log(f"[状态] 历史累计: {c}")
         return self.stats
+
+    def _collect_seller_items(self, seller: str, items: list[dict], pending_excel: list[dict]):
+        """按枚举结果采集（items: [{id, path}]）。"""
+        known = self.state.known_skus()
+        todo = [it for it in items
+                if it["id"] not in known or self.state.status(it["id"]) == "failed"]
+        done_cnt = len(items) - len(todo)
+        if done_cnt:
+            self.log(f"[增量] {done_cnt} 个已完成（断点跳过），待采集 {len(todo)}")
+        if not todo:
+            self.log("[增量] 无新品")
+            return
+        total = len(todo)
+        for idx, it in enumerate(todo, 1):
+            if self._stopped():
+                break
+            sku = it["id"]
+            url = it.get("path") or ""
+            if url.startswith("/"):
+                url = BASE + url
+            self.progress(idx, total, sku)
+            try:
+                self._collect_sku(sku, {"listing_id": sku, "url": url, "title": "", "price": None},
+                                  seller, pending_excel)
+            except Exception as e:
+                self.log(f"[SKU] {sku} 采集失败: {e}")
+                self.state.record(sku, "failed", error=str(e)[:200])
+                self.stats["failed"] += 1
+
+    def _seller_from_listing(self, url: str) -> str:
+        """从 /p/ 单商品链接解析卖家用户名（访问详情页提取）。"""
+        try:
+            path = url.split("?")[0]
+            resp = self.client.get(path, timeout=40, referer=BASE + "/")
+            seller = extract_seller_from_detail(resp.text)
+            if seller:
+                self.log(f"[解析] 单商品 {url.rsplit('/', 2)[-1][:40] if '/' in url else ''} → 卖家 {seller}")
+            return seller
+        except Exception as e:
+            self.log(f"[解析] 卖家解析失败: {e}")
+            return ""
+
+    def _collect_single(self, lid: str, url: str, pending_excel: list[dict]):
+        """兜底：单商品直接采集（卖家解析失败时）。"""
+        if self.state.status(lid) == "done":
+            self.log(f"[增量] {lid} 已完成，跳过")
+            return
+        self.progress(1, 1, lid)
+        try:
+            self._collect_sku(lid, {"listing_id": lid, "url": url, "title": "", "price": None}, "", pending_excel)
+        except Exception as e:
+            self.log(f"[SKU] {lid} 采集失败: {e}")
+            self.state.record(lid, "failed", error=str(e)[:200])
+            self.stats["failed"] += 1
 
     def _collect_seller(self, seller: str, url: str, pending_excel: list[dict]):
         # 1. 列表页

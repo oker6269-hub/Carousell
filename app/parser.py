@@ -31,6 +31,28 @@ def parse_listing_id_from_url(url: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def extract_seller_from_detail(html: str) -> str:
+    """从详情页 HTML 提取卖家用户名。
+
+    优先级：图片 alt「由 xxx 提交」> JSON username 最高频者 > /u/ 链接最高频者。
+    """
+    m = re.search(r"由\s+([A-Za-z0-9_.]{2,40})\s+提交", html)
+    if m:
+        return m.group(1)
+    from collections import Counter
+
+    hits = re.findall(r'"username"\s*:\s*"([A-Za-z0-9_.]{2,40})"', html)
+    if hits:
+        return Counter(hits).most_common(1)[0][0]
+    hits = re.findall(r"/u/([A-Za-z0-9_.]{2,40})", html)
+    if hits:
+        # 排除导航类
+        hits = [h for h in hits if h.lower() not in ("categories", "login", "signup")]
+        if hits:
+            return Counter(hits).most_common(1)[0][0]
+    return ""
+
+
 def parse_listing_cards(html: str) -> list[dict]:
     """解析 profile SSR HTML 的商品卡。
 

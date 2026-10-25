@@ -1,0 +1,376 @@
+# -*- coding: utf-8 -*-
+"""浏览器辅助层（最终版）
+
+职责（一次会话完成，用完即关）：
+1) 过 CF 挑战（复用持久 profile，通常 5-20s）
+2) 枚举卖家全部商品（点击「浏览更多」直到耗尽），返回 [{id, path, title?}]
+3) 导出 cf_clearance 等 cookie 供 curl_cffi 纯协议采集
+
+支持输入链接两种形态：
+- /u/{seller}/        卖家主页
+- /p/{slug}-{id}/     单商品 → 自动解析卖家 → 转入该卖家主页全量枚举
+"""
+import json
+import shutil
+import socket
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+from typing import Callable, Optional
+
+from .cf_session import _CDP, _pages_on, _wait_port, find_browser, _is_challenged
+
+CLICK_JS = """(() => {
+    const els = Array.from(document.querySelectorAll('button, [role=button]'));
+    const more = els.find(e => /浏览更多|瀏覽更多|load more|view more|查看更多/i.test(e.textContent || ''));
+    if (more) { more.scrollIntoView({block: 'center'}); more.click(); return true; }
+    return false;
+})()"""
+
+COUNT_JS = """document.querySelectorAll('a[href*="/p/"]').length"""
+
+EXTRACT_JS = """(() => {
+    const map = new Map();
+    document.querySelectorAll('a[href*="/p/"]').forEach(a => {
+        const href = a.getAttribute('href') || '';
+        const path = href.split('?')[0].split('#')[0];
+        const m = path.match(/-(\\d{6,})\\/?$/);
+        if (m && !map.has(m[1])) map.set(m[1], path);
+    });
+    return JSON.stringify(Array.from(map, ([id, path]) => ({id, path})));
+})()"""
+
+SELLER_JS = """(() => {
+    const counts = {};
+    document.querySelectorAll('a[href^="/u/"]').forEach(a => {
+        const m = (a.getAttribute('href') || '').match(/^\\/u\\/([A-Za-z0-9_.]+)\\/?$/);
+        if (m && !/^(categories|login|signup)$/i.test(m[1])) counts[m[1]] = (counts[m[1]] || 0) + 1;
+    });
+    const best = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+    return best ? best[0] : '';
+})()"""
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class BrowserSession:
+    """短生命周期浏览器会话。"""
+
+    def __init__(self, profile_dir: str, log: Callable[[str], None] = print,
+                 proxy: str = "", use_temp_profile: bool = False):
+        self.profile_dir = profile_dir
+        self.log = log
+        self.proxy = proxy
+        self.use_temp_profile = use_temp_profile
+        self.browser_path = find_browser()
+        self._proc: Optional[subprocess.Popen] = None
+        self._port = 0
+        self._temp_profile: Optional[str] = None
+        self.cookies: dict[str, str] = {}
+        self.user_agent = ""
+
+    # ---------- lifecycle ----------
+
+    def _profile(self) -> str:
+        if self.use_temp_profile:
+            self._temp_profile = tempfile.mkdtemp(prefix="carou-chrome-")
+            return self._temp_profile
+        Path(self.profile_dir).mkdir(parents=True, exist_ok=True)
+        return self.profile_dir
+
+    def _clear_profile_locks(self):
+        """清理残留锁（上次异常退出遗留）。"""
+        if self.use_temp_profile:
+            return
+        p = Path(self.profile_dir)
+        for name in ("SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile"):
+            try:
+                f = p / name
+                if f.exists() or f.is_symlink():
+                    f.unlink()
+            except Exception:
+                pass
+
+    def _launch(self, url: str) -> bool:
+        if not self.browser_path:
+            self.log("[浏览器] 未找到 Chrome/Edge，请安装 Google Chrome")
+            return False
+        self.close()
+        self._port = _free_port()
+        profile = self._profile()
+        cmd = [
+            self.browser_path,
+            f"--remote-debugging-port={self._port}",
+            f"--user-data-dir={profile}",
+            "--no-first-run", "--no-default-browser-check",
+            "--window-size=1000,780",
+            "--disable-session-crashed-bubble", "--hide-crash-restore-bubble",
+            url,
+        ]
+        if self.proxy:
+            cmd.append(f"--proxy-server={self.proxy}")
+        self._proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if _wait_port(self._port, timeout=30):
+            return True
+        # 重试一次：清理锁
+        self.log("[浏览器] 首次启动失败，清理 profile 锁后重试")
+        self.close()
+        self._clear_profile_locks()
+        self._port = _free_port()
+        cmd[1] = f"--remote-debugging-port={self._port}"
+        self._proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return _wait_port(self._port, timeout=30)
+
+    def close(self):
+        if self._proc:
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=6)
+            except Exception:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+            self._proc = None
+        if self._temp_profile:
+            time.sleep(0.4)
+            shutil.rmtree(self._temp_profile, ignore_errors=True)
+            self._temp_profile = None
+
+    # ---------- page ----------
+
+    def _page(self) -> Optional[dict]:
+        try:
+            for p in _pages_on(self._port):
+                if "carousell" in p.get("url", ""):
+                    return p
+            pages = _pages_on(self._port)
+            return pages[0] if pages else None
+        except Exception:
+            return None
+
+    def _wait_ready(self, timeout: float = 90.0) -> bool:
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            time.sleep(2)
+            try:
+                for p in _pages_on(self._port):
+                    if "carousell" in p.get("url", "") and not _is_challenged(p.get("title", "")) \
+                            and "__cf_chl" not in p.get("url", ""):
+                        return True
+            except Exception:
+                pass
+        return False
+
+    def _navigate(self, url: str) -> bool:
+        page = self._page()
+        if not page:
+            return False
+        cdp = _CDP(page["webSocketDebuggerUrl"])
+        try:
+            cdp.call("Page.enable", timeout=10)
+            cdp.call("Page.navigate", {"url": url}, timeout=20)
+            return True
+        except Exception:
+            return False
+        finally:
+            cdp.close()
+
+    # ---------- public ----------
+
+    def open_seller(self, url: str, challenge_timeout: float = 90.0) -> bool:
+        if not self._launch(url):
+            self.log("[浏览器] 启动失败")
+            return False
+        if not self._wait_ready(challenge_timeout):
+            self.log("[浏览器] CF 未通过（可能需要人工验证）")
+            return False
+        return True
+
+    def current_seller(self) -> str:
+        page = self._page()
+        if not page:
+            return ""
+        cdp = _CDP(page["webSocketDebuggerUrl"])
+        try:
+            cdp.call("Runtime.enable", timeout=15)
+            r = cdp.call("Runtime.evaluate", {"expression": SELLER_JS, "returnByValue": True}, timeout=15)
+            return r.get("result", {}).get("value") or ""
+        except Exception:
+            return ""
+        finally:
+            cdp.close()
+
+    def enumerate_items(self, max_items: int = 5000, idle_rounds: int = 4,
+                        click_wait: float = 1.2) -> list[dict]:
+        """展开「浏览更多」，返回 [{id, path}]。"""
+        page = self._page()
+        if not page:
+            return []
+        cdp = _CDP(page["webSocketDebuggerUrl"])
+        items: list[dict] = []
+        try:
+            cdp.call("Runtime.enable", timeout=15)
+            self._wait_hydrate(cdp)
+            last = self._count(cdp)
+            self.log(f"[枚举] 初始 {last} 个商品，展开中…")
+            idle = 0
+            for _ in range(500):
+                if last >= max_items:
+                    break
+                clicked = self._click(cdp)
+                time.sleep(click_wait)
+                cur = self._count(cdp)
+                if cur > last:
+                    self.log(f"[枚举] 已加载 {cur} 个")
+                    last = cur
+                    idle = 0
+                else:
+                    idle += 1
+                    if idle >= idle_rounds:
+                        # 最后确认：按钮是否还存在
+                        if not self._has_more(cdp):
+                            break
+                        if not clicked:
+                            break
+                        time.sleep(1.5)
+                    else:
+                        time.sleep(1.0)
+            raw = cdp.call("Runtime.evaluate", {"expression": EXTRACT_JS, "returnByValue": True}, timeout=30)
+            items = json.loads(raw.get("result", {}).get("value") or "[]")
+            self.log(f"[枚举] 完成：{len(items)} 个商品")
+        except Exception as e:
+            self.log(f"[枚举] 异常: {e}")
+        finally:
+            cdp.close()
+        return items
+
+    def _wait_hydrate(self, cdp: "_CDP", timeout: float = 20.0) -> bool:
+        """等待页面水合完成（React 挂载、商品卡渲染、『浏览更多』按钮出现）。"""
+        t0 = time.time()
+        ready = False
+        while time.time() - t0 < timeout:
+            try:
+                r = cdp.call("Runtime.evaluate", {"expression": """(() => {
+                    const links = document.querySelectorAll('a[href*="/p/"]').length;
+                    const hasBtn = [...document.querySelectorAll('button,[role=button]')]
+                        .some(e => /浏览更多|瀏覽更多|load more|view more|查看更多/i.test(e.textContent || ''));
+                    return JSON.stringify({links, hasBtn, ready: document.readyState});
+                })()""", "returnByValue": True}, timeout=15)
+                st = json.loads(r.get("result", {}).get("value") or "{}")
+                if st.get("ready") == "complete" and st.get("links", 0) > 0:
+                    ready = True
+                    if st.get("hasBtn"):
+                        return True
+                    # 无按钮：可能卖家 ≤20 个，也可能按钮在懒加载 —— 再等几秒
+                    if time.time() - t0 > 8:
+                        return True
+            except Exception:
+                pass
+            time.sleep(1)
+        return ready
+
+    def _has_more(self, cdp: "_CDP") -> bool:
+        try:
+            r = cdp.call("Runtime.evaluate", {"expression": """(() => {
+                return [...document.querySelectorAll('button,[role=button]')]
+                    .some(e => /浏览更多|瀏覽更多|load more|view more|查看更多/i.test(e.textContent || ''));
+            })()""", "returnByValue": True}, timeout=15)
+            return bool(r.get("result", {}).get("value"))
+        except Exception:
+            return False
+
+    def export_cookies(self, base_url: str = "https://www.carousell.com.hk/") -> bool:
+        page = self._page()
+        if not page:
+            return False
+        cdp = _CDP(page["webSocketDebuggerUrl"])
+        try:
+            res = cdp.call("Network.getCookies", {"urls": [base_url]}, timeout=15)
+            self.cookies = {c["name"]: c["value"] for c in res.get("cookies", [])}
+            ua = cdp.call("Runtime.evaluate", {"expression": "navigator.userAgent", "returnByValue": True}, timeout=10)
+            self.user_agent = ua.get("result", {}).get("value", "") or ""
+            self.log(f"[浏览器] 导出 {len(self.cookies)} 个 cookie（cf_clearance: "
+                     f"{'有' if 'cf_clearance' in self.cookies else '无'}）")
+            return "cf_clearance" in self.cookies
+        except Exception as e:
+            self.log(f"[浏览器] cookie 导出失败: {e}")
+            return False
+        finally:
+            cdp.close()
+
+    def collect_sellers(self, urls: list[str], max_items: int = 5000,
+                        log_progress: Optional[Callable[[int, int, str], None]] = None) -> dict:
+        """对一组输入链接（主页或商品）枚举全部商品。
+
+        返回 {"sellers": {seller: [items]}, "cookie_ok": bool}
+        """
+        from .parser import parse_link_kind, parse_seller_username, parse_listing_id_from_url
+
+        result = {"sellers": {}, "cookie_ok": False}
+        try:
+            if not self.browser_path:
+                return result
+            first = True
+            for i, url in enumerate(urls, 1):
+                kind = parse_link_kind(url)
+                if kind == "unknown":
+                    continue
+                if first:
+                    if not self.open_seller(url):
+                        return result
+                    first = False
+                else:
+                    if not self._navigate(url):
+                        continue
+                    if not self._wait_ready(60):
+                        self.log(f"[浏览器] {url[:50]} 未就绪，跳过")
+                        continue
+
+                seller = ""
+                if kind == "seller":
+                    seller = parse_seller_username(url) or ""
+                else:
+                    seller = self.current_seller()
+                    self.log(f"[解析] 单商品 → 卖家 {seller or '(未识别)'}")
+                    if seller:
+                        if not self._navigate(f"https://www.carousell.com.hk/u/{seller}/"):
+                            continue
+                        if not self._wait_ready(60):
+                            continue
+
+                if not seller:
+                    continue
+                if seller in result["sellers"]:
+                    self.log(f"[枚举] {seller} 已枚举，跳过")
+                    continue
+                if log_progress:
+                    log_progress(i, len(urls), seller)
+                self.log(f"[枚举] 卖家 {seller} 全量展开…")
+                result["sellers"][seller] = self.enumerate_items(max_items=max_items)
+
+            result["cookie_ok"] = self.export_cookies()
+            return result
+        finally:
+            self.close()
+
+    # ---------- low-level ----------
+
+    def _click(self, cdp: "_CDP") -> bool:
+        try:
+            r = cdp.call("Runtime.evaluate", {"expression": CLICK_JS, "returnByValue": True}, timeout=20)
+            return bool(r.get("result", {}).get("value"))
+        except Exception:
+            return False
+
+    def _count(self, cdp: "_CDP") -> int:
+        try:
+            r = cdp.call("Runtime.evaluate", {"expression": COUNT_JS, "returnByValue": True}, timeout=20)
+            return int(r.get("result", {}).get("value") or 0)
+        except Exception:
+            return 0

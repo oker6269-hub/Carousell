@@ -60,7 +60,7 @@ class App:
 
         row2 = ttk.Frame(top)
         row2.pack(fill="x", padx=8, pady=4)
-        ttk.Label(row2, text="卖家链接(每行一条):").pack(anchor="w")
+        ttk.Label(row2, text="链接(每行一条，/u/ 主页或 /p/ 商品链接均自动全量采集该卖家):").pack(anchor="w")
         self.txt_urls = tk.Text(row2, height=5, wrap="char")
         self.txt_urls.pack(fill="x")
 
@@ -72,6 +72,9 @@ class App:
         ttk.Label(row3, text="图片并发:").pack(side="left")
         self.var_workers = tk.StringVar(value="4")
         ttk.Spinbox(row3, from_=1, to=16, textvariable=self.var_workers, width=5).pack(side="left", padx=4)
+        ttk.Label(row3, text="每卖家上限:").pack(side="left", padx=(8, 2))
+        self.var_max_items = tk.StringVar(value="5000")
+        ttk.Spinbox(row3, from_=20, to=20000, increment=100, textvariable=self.var_max_items, width=7).pack(side="left", padx=4)
 
         # 过滤管理
         filt = ttk.LabelFrame(self.root, text="② 类目跳过管理（持久化，保存于根路径 filters.json）")
@@ -93,8 +96,8 @@ class App:
         self.lbl_cats = ttk.Label(filt, text="", foreground="#666")
         self.lbl_cats.pack(anchor="w", padx=8)
 
-        # 运行控制
-        run = ttk.LabelFrame(self.root, text="③ 运行")
+        # 运行控制 + 自动更新调度
+        run = ttk.LabelFrame(self.root, text="③ 运行 / 自动更新")
         run.pack(fill="x", **pad)
         rrow = ttk.Frame(run)
         rrow.pack(fill="x", padx=8, pady=4)
@@ -102,6 +105,27 @@ class App:
         self.btn_start.pack(side="left")
         self.btn_stop = ttk.Button(rrow, text="■ 停止", command=self._stop, state="disabled")
         self.btn_stop.pack(side="left", padx=6)
+
+        # 自动更新配置行
+        arow = ttk.Frame(run)
+        arow.pack(fill="x", padx=8, pady=2)
+        self.var_auto_on = tk.BooleanVar(value=False)
+        ttk.Checkbutton(arow, text="自动更新", variable=self.var_auto_on, command=self._toggle_auto).pack(side="left")
+        ttk.Label(arow, text="模式:").pack(side="left", padx=(10, 2))
+        self.var_auto_mode = tk.StringVar(value="interval")
+        self.cmb_auto_mode = ttk.Combobox(arow, textvariable=self.var_auto_mode, values=["interval", "daily"], width=8, state="readonly")
+        self.cmb_auto_mode.pack(side="left")
+        self.cmb_auto_mode.bind("<<ComboboxSelected>>", lambda e: self._auto_mode_changed())
+        ttk.Label(arow, text="间隔(分钟):").pack(side="left", padx=(10, 2))
+        self.var_auto_interval = tk.StringVar(value="60")
+        ttk.Spinbox(arow, from_=1, to=1440, textvariable=self.var_auto_interval, width=6).pack(side="left")
+        ttk.Label(arow, text="每日时间:").pack(side="left", padx=(10, 2))
+        self.var_auto_daily = tk.StringVar(value="09:00")
+        ttk.Entry(arow, textvariable=self.var_auto_daily, width=7).pack(side="left")
+        ttk.Button(arow, text="立即更新一次", command=self._trigger_now).pack(side="left", padx=10)
+        self.lbl_sched = ttk.Label(run, text="自动更新: 关", foreground="#666")
+        self.lbl_sched.pack(anchor="w", padx=8)
+
         self.progress = ttk.Progressbar(run, mode="determinate")
         self.progress.pack(fill="x", padx=8, pady=4)
         self.lbl_progress = ttk.Label(run, text="就绪")
@@ -206,16 +230,31 @@ class App:
             workers = max(1, int(self.var_workers.get()))
         except ValueError:
             workers = 4
+        try:
+            max_items = max(20, int(self.var_max_items.get()))
+        except ValueError:
+            max_items = 5000
         proxy = self.var_proxy.get().strip()
 
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
         self.progress.configure(value=0, maximum=100)
         self.log("=" * 56)
-        self.log(f"[启动] 根路径 {root} | 链接 {len(urls)} 条 | 图片并发 {workers}" + (f" | 代理 {proxy}" if proxy else " | 直连"))
+        self.log(f"[启动] 根路径 {root} | 链接 {len(urls)} 条 | 图片并发 {workers} | 每卖家上限 {max_items}"
+                 + (f" | 代理 {proxy}" if proxy else " | 直连"))
 
-        self.engine = CollectorEngine(root, log=self.log, progress=self._on_progress, proxy=proxy, img_workers=workers)
-        # 同步过滤器到引擎
+        self._run_collect(urls, root, workers, proxy, max_items=max_items)
+
+    def _run_collect(self, urls, root, workers, proxy, quiet=False, max_items=5000):
+        """启动一次采集线程（手动/调度共用）。"""
+        if self.worker and self.worker.is_alive():
+            self.log("[跳过] 采集正在进行中")
+            return
+        self.btn_start.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+        self.progress.configure(value=0, maximum=100)
+        self.engine = CollectorEngine(root, log=self.log, progress=self._on_progress, proxy=proxy,
+                                      img_workers=workers, max_items=max_items)
         self.engine.filters = self.fstore
 
         def work():
@@ -235,6 +274,73 @@ class App:
         if self.engine:
             self.engine.stop()
             self.log("[停止] 已请求中止（将在当前 SKU 完成后停止）")
+        if self.sched:
+            self.sched.stop()
+            self.lbl_sched.configure(text="自动更新: 关")
+
+    # ---------------- auto update scheduler ----------------
+
+    def _toggle_auto(self):
+        if self.var_auto_on.get():
+            self._start_auto()
+        else:
+            if getattr(self, "sched", None):
+                self.sched.stop()
+            self.lbl_sched.configure(text="自动更新: 关")
+
+    def _auto_mode_changed(self):
+        if self.var_auto_on.get():
+            self._start_auto()
+
+    def _start_auto(self):
+        from .scheduler import UpdateScheduler
+        root = self._root()
+        urls = [l.strip() for l in self.txt_urls.get("1.0", "end").splitlines() if l.strip()]
+        if not root or not urls:
+            messagebox.showwarning("缺少配置", "自动更新需先设置根路径与链接")
+            self.var_auto_on.set(False)
+            return
+        try:
+            workers = max(1, int(self.var_workers.get()))
+        except ValueError:
+            workers = 4
+        proxy = self.var_proxy.get().strip()
+        mode = self.var_auto_mode.get()
+        try:
+            interval = max(1, int(self.var_auto_interval.get()))
+        except ValueError:
+            interval = 60
+        daily = self.var_auto_daily.get().strip() or "09:00"
+
+        if getattr(self, "sched", None):
+            self.sched.stop()
+
+        def do_run():
+            self._run_collect(urls, root, workers, proxy)
+
+        self.sched = UpdateScheduler(do_run, log=self.log)
+        self.sched.configure(mode, interval_min=interval, daily_hhmm=daily)
+        self.sched.start()
+
+        def refresh_label():
+            while True:
+                try:
+                    nr = self.sched.next_run
+                    self.lbl_sched.configure(
+                        text=f"自动更新: 开 | 模式 {mode} | 下次 {nr:%m-%d %H:%M}" if nr else f"自动更新: 开 | 模式 {mode}")
+                except Exception:
+                    pass
+                import time as _t
+                _t.sleep(30)
+        threading.Thread(target=refresh_label, daemon=True).start()
+
+    def _trigger_now(self):
+        if getattr(self, "sched", None) and self.sched._thread and self.sched._thread.is_alive():
+            self.sched.trigger_now()
+            self.log("[调度] 已请求立即更新")
+        else:
+            # 未开自动更新：等同手动开始
+            self._start()
 
     def _on_progress(self, cur: int, total: int, msg: str):
         def upd():

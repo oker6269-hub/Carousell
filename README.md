@@ -5,16 +5,25 @@
 ## 原理
 
 ```
-Chrome（真实浏览器，直连）一次性突破 Cloudflare 挑战 (~15-20s，首次)
-   ↓ 提取 cf_clearance cookie（缓存复用，失效自动重过）
-curl_cffi（chrome150 TLS 指纹）纯协议直连高速采集
-   ├─ 列表页 /u/{user}/   SSR HTML → 商品卡（listing ID/标题/价格）
+① 浏览器会话（一次，用完即关）
+   Chrome（复用持久 profile，CF 通常 5-20s 通过）
+   ├─ 打开卖家页 /u/{user}/（或 /p/ 商品 → 自动解析卖家 → 转主页）
+   ├─ 循环点击「浏览更多」展开全部商品（每次 +20，直到耗尽）
+   ├─ 提取全部商品 ID + 链接（实测单卖家可达 3500+）
+   └─ 导出 cf_clearance 等 cookie
+② 纯协议采集（curl_cffi chrome150，直连，无需代理）
    ├─ 详情页 /p/{slug}/   ld+json → 描述/价格/成色/图片数组/分类
    └─ 图片   media.karousell.com  直连下载（无 CF，线程池并发）
+③ 落盘
+   ├─ {root}/{SKU}/SKU_01.jpg …
+   ├─ {root}/素材保存表格.xlsx（模板 12 列，追加去重）
+   └─ state.json 断点 / filters.json 类目过滤
 ```
 
-- 全程**默认直连，无需代理**；代理可选（GUI/CLI 配置）
+- **浏览器只负责枚举商品清单**（这是唯一必须 JS 的环节），其余全部纯协议
+- 默认**直连免代理**；代理可选（GUI/CLI 配置）
 - 反爬应对：随机请求间隔、失败重试（指数退避）、CF 失效自动重过、failed 复跑自动重试
+- 规模参考：3500 个商品的卖家，枚举约 15 分钟，之后逐条采集详情与图片（每条约 2-5s）
 
 ## 使用（GUI）
 
@@ -28,8 +37,19 @@ curl_cffi（chrome150 TLS 指纹）纯协议直连高速采集
 ## 使用（CLI）
 
 ```bash
-CarousellCollector.exe --root D:\materials --urls https://www.carousell.com.hk/u/xxx/ https://www.carousell.com.hk/u/yyy/ [--workers 4] [--proxy socks5://127.0.0.1:1080]
+CarousellCollector.exe --root D:\materials --urls https://www.carousell.com.hk/u/xxx/ [--workers 4] [--max-items 5000] [--proxy socks5://127.0.0.1:1080]
+# 定时自动更新（增量拉新品）
+CarousellCollector.exe --root D:\materials --urls URL --watch 60          # 每 60 分钟
+CarousellCollector.exe --root D:\materials --urls URL --watch-daily 09:00  # 每天 09:00
 ```
+
+## 链接形态
+
+| 输入 | 行为 |
+|---|---|
+| `https://www.carousell.com.hk/u/{卖家}/` | 枚举该卖家**全部**在售商品并采集 |
+| `https://www.carousell.com.hk/p/{slug}-{id}/` | 自动解析该商品卖家 → 转入卖家主页**全量**枚举采集 |
+| 混合多行 | 逐条处理，同一卖家自动去重 |
 
 ## 输出结构
 
