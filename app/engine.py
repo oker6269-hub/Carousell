@@ -48,37 +48,71 @@ class CollectorEngine:
 
         # 运行统计
         self.stats = {"new": 0, "skipped": 0, "failed": 0, "images": 0}
+        # 退出兜底：解释器退出时确保 Chrome 被回收（macOS/Linux SIGTERM/Ctrl+C 场景）
+        import atexit
+        atexit.register(self.kill_browser)
 
     # ---------------- lifecycle ----------------
 
     def stop(self):
+        """请求停止：置停止标志并立刻回收浏览器进程。"""
         self.stop_event.set()
+        self.kill_browser()
+
+    def kill_browser(self):
+        bs = getattr(self, "_browser", None)
+        if bs is not None:
+            try:
+                bs.close()
+            except Exception:
+                pass
 
     def _stopped(self) -> bool:
         return self.stop_event.is_set()
 
     # ---------------- session ----------------
 
+    def _load_cached_session(self) -> bool:
+        """仅从缓存恢复会话（不启动浏览器）。"""
+        cache = self.root / ".cf-session.json"
+        if self.cf.load(str(cache)) and self.cf.cookies.get("cf_clearance"):
+            self.client = HttpClient(self.cf, log=self.log, min_delay=self.min_delay,
+                                     max_delay=self.max_delay, refresh_fn=self._reauth_once)
+            return True
+        return False
+
+    def _reauth_once(self) -> bool:
+        """CF 失效时重建 cookie：一次短会话，最多执行一次。"""
+        if getattr(self, "_reauth_done", False):
+            return False
+        self._reauth_done = True
+        from .browser import BrowserSession
+
+        bs = BrowserSession(str(self.profile_dir), log=self.log, proxy=self.proxy)
+        self._browser = bs
+        try:
+            if not bs.open_seller(BASE + "/"):
+                return False
+            ok = bs.export_cookies()
+        finally:
+            bs.close()
+            self._browser = None
+        if ok:
+            self.cf.cookies = bs.cookies
+            self.cf.user_agent = bs.user_agent or self.cf.user_agent
+            self.cf.save(str(self.root / ".cf-session.json"))
+            self.log("[会话] 已续期 cf_clearance")
+        return ok
+
     def ensure_session(self, force: bool = False) -> bool:
-        """获取/续期 CF 会话并构建 HTTP 客户端。"""
-        cookie_cache = self.root / ".cf-session.json"
-        if not force and self.cf.load(str(cookie_cache)):
-            self.log("[会话] 复用缓存 cf_clearance（失效将自动重过）")
-            self.client = HttpClient(self.cf, log=self.log, min_delay=self.min_delay, max_delay=self.max_delay)
-            # 快速探活
+        """兼容旧接口：先试缓存，失败才开一次浏览器。"""
+        if not force and self._load_cached_session():
             try:
-                resp = self.client.get(BASE + "/", timeout=20)
-                if resp.status_code == 200:
-                    self.log("[会话] 缓存 cookie 有效")
+                if self.client.get(BASE + "/", timeout=20).status_code == 200:
                     return True
             except Exception:
-                self.log("[会话] 缓存 cookie 探活失败，重新突破")
-        ok = self.cf.obtain(BASE + "/")
-        if not ok:
-            return False
-        self.cf.save(str(cookie_cache))
-        self.client = HttpClient(self.cf, log=self.log, min_delay=self.min_delay, max_delay=self.max_delay)
-        return True
+                pass
+        return self._reauth_once()
 
     # ---------------- collection ----------------
 
@@ -91,12 +125,13 @@ class CollectorEngine:
         self.log(f"[开始] 共 {len(urls)} 个链接，根目录: {self.root}")
         self.log(f"[过滤] 类目跳过: {'开' if self.filters.enabled else '关'}，规则: {self.filters.categories()}")
 
-        # ---- 1. 浏览器会话：过 CF + 枚举全部商品 + 导出 cookie ----
+        # ---- 1. 浏览器会话（只开一次）：过 CF + 枚举全部商品 + 导出 cookie ----
         from .browser import BrowserSession
 
         enum_sellers: dict[str, list[dict]] = {}
+        bs = BrowserSession(str(self.profile_dir), log=self.log, proxy=self.proxy)
+        self._browser = bs
         try:
-            bs = BrowserSession(str(self.profile_dir), log=self.log, proxy=self.proxy)
             res = bs.collect_sellers(urls, max_items=self.max_items,
                                      log_progress=lambda c, t, m: self.progress(c, t, f"枚举 {m}"))
             enum_sellers = res.get("sellers", {})
@@ -107,13 +142,18 @@ class CollectorEngine:
                 self.log(f"[会话] 已用浏览器 cookie 更新会话（{len(bs.cookies)} 个）")
         except Exception as e:
             self.log(f"[浏览器] 枚举失败: {e}")
+        finally:
+            bs.close()
+            self._browser = None
 
-        # ---- 2. 建立 HTTP 会话 ----
+        # ---- 2. 建立 HTTP 会话（优先浏览器 cookie，其次缓存；不再另起浏览器） ----
         if self.cf.cookies:
-            self.client = HttpClient(self.cf, log=self.log,
-                                     min_delay=self.min_delay, max_delay=self.max_delay)
-        elif not self.ensure_session():
-            self.log("[错误] CF 会话建立失败，退出")
+            self.client = HttpClient(self.cf, log=self.log, min_delay=self.min_delay,
+                                     max_delay=self.max_delay, refresh_fn=self._reauth_once)
+        elif self._load_cached_session():
+            self.log("[会话] 使用缓存的 cf_clearance")
+        else:
+            self.log("[错误] 未能取得 cf_clearance（浏览器未就绪），请确认 Chrome 可正常访问 Carousell 后重试")
             return self.stats
 
         # ---- 3. 逐卖家采集 ----

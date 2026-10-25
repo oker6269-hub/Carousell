@@ -65,11 +65,44 @@ CarousellCollector.exe --root D:\materials --urls URL --watch-daily 09:00  # 每
 └── logs/                # 采集日志
 ```
 
-## 断点/增量
+### Folder 列 = 图片目录（绝对路径，跨平台）
 
-- 复跑自动跳过 `done` 的 SKU（列表页对比 state.json）
-- `failed` 的 SKU 自动重试
-- 想强制重采某 SKU：删 `state.json` 里对应条目 + 对应目录
+| `--path-style` | Windows 输出 | macOS 输出 |
+|---|---|---|
+| `native`（默认） | `D:\materials\1470110967` | `/Users/me/materials/1470110967` |
+| `posix` | `D:/materials/1470110967` | `/Users/me/materials/1470110967` |
+| `relative` | `1470110967` | `1470110967` |
+
+- `native` 用系统原生分隔符，直接复制到资源管理器 / Finder 可用
+- `posix` 统一正斜杠，便于把表格导入其他系统（Windows 上 mac 路径风格混用时的推荐）
+- Excel 文件被占用（正在用 Excel 打开）时，会自动重试 3 次，仍失败则另存为 `素材保存表格_时间戳.xlsx`
+
+## 断点 / 增量 / 定时更新
+
+### 三轮去重（互不依赖，任一满足即跳过）
+
+| 层级 | 依据 | 行为 |
+|---|---|---|
+| ① SKU 层 | `state.json` 中的 `listing_id` 状态 | `done` 跳过；`failed` 自动重试；`skipped` 保持跳过 |
+| ② 文件层 | 目标图片已存在且大小 > 0 | 直接复用，不重复下载（换网络/中断后重跑极快） |
+| ③ 表格层 | Excel 中已有该 SKU 行 | 不重复追加，避免重复行 |
+
+### 定时自动更新（只拉新品）
+
+```bash
+# 每 60 分钟跑一轮；每轮只采集「枚举到但 state 里没有」的新 SKU
+CarousellCollector.exe --root D:\materials --urls URL --watch 60
+# 每天 09:00 跑一轮
+CarousellCollector.exe --root D:\materials --urls URL --watch-daily 09:00
+```
+
+GUI 里勾选「自动更新」+ 选择 `interval`/`daily` 同样生效；「立即更新一次」可手动触发。
+
+**增量语义**：卖家新增商品 → 下一轮枚举会看到新 ID → 只下载这些新 ID 的详情与图片 → 追加到 Excel 末尾。已采过的商品不会被重新请求（除非状态是 `failed`）。
+
+### 强制重采某个 SKU
+
+删 `state.json` 里对应条目，并删除该 SKU 目录（或删目录内图片）即可。
 
 ## 依赖要求
 
@@ -88,10 +121,33 @@ python -m app.main --root ... --urls ...   # CLI
 
 ```bash
 pyinstaller build.spec --noconfirm
-# 产物: dist/CarousellCollector/
+# Windows: dist/CarousellCollector/CarousellCollector.exe
+# macOS:   dist/CarousellCollector.app（双击）+ dist/CarousellCollector/（CLI）
+# macOS Intel 交叉构建: CC_TARGET_ARCH=x86_64 pyinstaller build.spec --noconfirm
 ```
 
-GitHub Actions：打 tag `v*` 自动构建 Windows x64 + macOS arm64 双平台产物并发布 Release（见 `.github/workflows/build.yml`）。
+GitHub Actions（`.github/workflows/build.yml`）：
+
+| 产物 | 运行器 | 说明 |
+|---|---|---|
+| `CarousellCollector-windows-x64.zip` | windows-latest | Windows x64 |
+| `CarousellCollector-macos-arm64.zip` | macos-14 (arm64) | Apple Silicon，含 `.app` |
+| `CarousellCollector-macos-x64.zip` | macos-14 + `target_arch=x86_64` | Intel Mac |
+| `*-cli.tar.gz` | macos | 命令行目录版 |
+
+打 tag 即构建并发布 Release：
+
+```bash
+git tag v1.0.2 && git push origin v1.0.2
+```
+
+### macOS 首次打开说明
+
+构建产物未做代码签名，首次打开会提示「无法验证开发者」：
+
+- **方式一**：右键点 `CarousellCollector.app` → 打开 → 再点「打开」
+- **方式二**：终端执行 `xattr -dr com.apple.quarantine CarousellCollector.app`
+- 需要系统已安装 **Google Chrome**（用于突破 CF 拿商品清单）
 
 ## 注意
 

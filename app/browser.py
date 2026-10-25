@@ -10,8 +10,11 @@
 - /u/{seller}/        卖家主页
 - /p/{slug}-{id}/     单商品 → 自动解析卖家 → 转入该卖家主页全量枚举
 """
+import atexit
 import json
+import os
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
@@ -101,6 +104,7 @@ class BrowserSession:
             self.log("[浏览器] 未找到 Chrome/Edge，请安装 Google Chrome")
             return False
         self.close()
+        self._kill_stale()
         self._port = _free_port()
         profile = self._profile()
         cmd = [
@@ -110,35 +114,69 @@ class BrowserSession:
             "--no-first-run", "--no-default-browser-check",
             "--window-size=1000,780",
             "--disable-session-crashed-bubble", "--hide-crash-restore-bubble",
+            "--disable-background-networking",
             url,
         ]
         if self.proxy:
             cmd.append(f"--proxy-server={self.proxy}")
-        self._proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # POSIX：独立会话，便于整组回收（Chrome 会派生多个子进程）
+        kwargs = {"start_new_session": True} if os.name == "posix" else {}
+        self._proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL, **kwargs)
+        atexit.register(self.close)
         if _wait_port(self._port, timeout=30):
             return True
-        # 重试一次：清理锁
-        self.log("[浏览器] 首次启动失败，清理 profile 锁后重试")
+        self.log("[浏览器] 首次启动失败，清理锁后重试")
         self.close()
         self._clear_profile_locks()
-        self._port = _free_port()
-        cmd[1] = f"--remote-debugging-port={self._port}"
-        self._proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return _wait_port(self._port, timeout=30)
+        return False
+
+    def _kill_stale(self):
+        """清理上次异常退出残留的、使用我们 profile 的 Chrome 进程。"""
+        if os.name != "posix":
+            return
+        try:
+            subprocess.run(["pkill", "-f", self.profile_dir],
+                           capture_output=True, timeout=10)
+        except Exception:
+            pass
 
     def close(self):
-        if self._proc:
+        """彻底回收：杀掉 Chrome 整个进程组（含渲染器/GPU 子进程）。"""
+        proc = self._proc
+        self._proc = None
+        if proc:
+            pid = proc.pid
             try:
-                self._proc.terminate()
-                self._proc.wait(timeout=6)
+                if os.name == "posix":
+                    # 先整组 SIGTERM，再 SIGKILL 兜底
+                    try:
+                        os.killpg(os.getpgid(pid), signal.SIGTERM)
+                    except Exception:
+                        proc.terminate()
+                    try:
+                        proc.wait(timeout=4)
+                    except Exception:
+                        try:
+                            os.killpg(os.getpgid(pid), signal.SIGKILL)
+                        except Exception:
+                            proc.kill()
+                else:
+                    # Windows：taskkill /T 连带子进程
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                                   capture_output=True, timeout=15)
+                    try:
+                        proc.wait(timeout=4)
+                    except Exception:
+                        proc.kill()
             except Exception:
                 try:
-                    self._proc.kill()
+                    proc.kill()
                 except Exception:
                     pass
-            self._proc = None
+        self._kill_stale()
         if self._temp_profile:
-            time.sleep(0.4)
+            time.sleep(0.3)
             shutil.rmtree(self._temp_profile, ignore_errors=True)
             self._temp_profile = None
 
@@ -194,16 +232,25 @@ class BrowserSession:
         return False
 
     def open_seller(self, url: str, challenge_timeout: float = 120.0) -> bool:
-        """启动并等待就绪（失败自动重试一次，复用 profile 内的 clearance）。"""
-        for attempt in (1, 2):
-            if not self._launch(url):
-                self.log(f"[浏览器] 启动失败（第 {attempt} 次）")
-                continue
-            if self._wait_ready(challenge_timeout):
+        """启动并等待就绪。
+
+        只在**进程已死**时重新拉起浏览器；进程存活则复用同一实例重试导航，
+        避免重复拉起 Chrome（macOS 上反复弹窗的问题）。
+        """
+        if not self._launch(url):
+            self.log("[浏览器] 启动失败")
+            return False
+        for attempt in (1, 2, 3):
+            if self._wait_ready(challenge_timeout if attempt == 1 else 45):
                 return True
-            self.log(f"[浏览器] 第 {attempt} 次未就绪（CF 挑战未完成），重试…")
-            self.close()
-            time.sleep(2)
+            alive = self._proc is not None and self._proc.poll() is None
+            if not alive:
+                self.log(f"[浏览器] 进程已退出，重新拉起（第 {attempt} 次）")
+                if not self._launch(url):
+                    return False
+                continue
+            self.log(f"[浏览器] 尚未就绪，复用现有窗口重试导航（第 {attempt} 次）")
+            self._navigate(url)
         self.log("[浏览器] CF 未通过（可在弹出的窗口手动完成验证后重跑）")
         return False
 

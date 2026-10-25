@@ -20,12 +20,14 @@ class HttpClient:
     """线程安全的采集会话：多线程共享 curl_cffi Session。"""
 
     def __init__(self, cf: CFSession, log: Callable[[str], None] = print,
-                 min_delay: float = 0.6, max_delay: float = 1.6, max_retries: int = 3):
+                 min_delay: float = 0.6, max_delay: float = 1.6, max_retries: int = 3,
+                 refresh_fn: Optional[Callable[[], bool]] = None):
         self.cf = cf
         self.log = log
         self.min_delay = min_delay
         self.max_delay = max_delay
         self.max_retries = max_retries
+        self.refresh_fn = refresh_fn      # 会话续期回调（最多调用一次，由引擎控制）
         self._lock = threading.Lock()
         self._last_req = 0.0
         self._session = self._build()
@@ -74,14 +76,26 @@ class HttpClient:
         return False
 
     def _refresh_session(self):
-        """CF 失效自愈：重新过挑战并重建会话。"""
-        self.log("[HTTP] cf_clearance 失效，自动重新突破…")
-        ok = self.cf.obtain("https://www.carousell.com.hk/")
-        if ok:
+        """CF 失效自愈：由引擎提供的回调续期（最多一次，避免重复拉起浏览器）。"""
+        if not self.refresh_fn:
+            self.log("[HTTP] cf_clearance 失效且无续期能力，中止")
+            return False
+        self.log("[HTTP] cf_clearance 失效，尝试续期…")
+        try:
+            if not self.refresh_fn():
+                return False
             with self._lock:
                 self._session = self._build()
-            self.log("[HTTP] 会话已续期")
-        return ok
+            return True
+        except Exception as e:
+            self.log(f"[HTTP] 续期失败: {e}")
+            return False
+
+    def close(self):
+        try:
+            self._session.close()
+        except Exception:
+            pass
 
     # ---------- public ----------
 

@@ -29,6 +29,22 @@ def _fix_console_utf8():
                 pass
 
 
+def _install_signal_handlers():
+    """SIGTERM / SIGHUP（macOS 关终端窗口、kill 命令）→ 走正常退出流程，触发 atexit 回收 Chrome。"""
+    import signal
+
+    def _handler(signum, frame):
+        raise SystemExit(0)
+
+    for name in ("SIGTERM", "SIGHUP", "SIGINT"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, _handler)
+            except Exception:
+                pass
+
+
 def _setup_file_log(root: str):
     """把 engine 日志同步写入 logs/collector_日期.log。"""
     logs = Path(root) / "logs"
@@ -43,6 +59,7 @@ def run_cli(args) -> int:
     from .scheduler import UpdateScheduler
 
     _fix_console_utf8()
+    _install_signal_handlers()
     fh, logpath = _setup_file_log(args.root)
 
     def log(msg: str):
@@ -52,33 +69,45 @@ def run_cli(args) -> int:
         fh.flush()
 
     log(f"日志文件: {logpath}")
+    _holder: dict = {}
 
     def run_once() -> dict:
         engine = CollectorEngine(args.root, log=log, proxy=args.proxy, img_workers=args.workers,
                                  max_items=getattr(args, "max_items", 5000),
                                  path_style=getattr(args, "path_style", "native"))
-        return engine.collect(args.urls)
-
-    if args.watch_daily or args.watch:
-        # 定时模式：首次全量 + 之后增量
-        mode = "daily" if args.watch_daily else "interval"
-        sched = UpdateScheduler(run_once, log=log)
-        sched.configure(mode, interval_min=args.watch or 60, daily_hhmm=args.watch_daily or "09:00")
-        log(f"[定时] 模式={mode} 间隔={args.watch}分钟 每日={args.watch_daily or '-'}")
-        run_once()  # 启动立即跑一次
-        sched.start()
+        _holder["engine"] = engine
         try:
+            return engine.collect(args.urls)
+        finally:
+            engine.kill_browser()
+
+    sched = None
+    try:
+        if args.watch_daily or args.watch:
+            # 定时模式：首次全量 + 之后增量
+            mode = "daily" if args.watch_daily else "interval"
+            sched = UpdateScheduler(run_once, log=log)
+            sched.configure(mode, interval_min=args.watch or 60, daily_hhmm=args.watch_daily or "09:00")
+            log(f"[定时] 模式={mode} 间隔={args.watch}分钟 每日={args.watch_daily or '-'}")
+            run_once()  # 启动立即跑一次
+            sched.start()
             while True:
                 time.sleep(60)
-        except KeyboardInterrupt:
-            log("[退出] Ctrl+C")
+        stats = run_once()
+        return 0 if stats else 1
+    except KeyboardInterrupt:
+        log("[退出] Ctrl+C，正在回收浏览器进程…")
+        eng = _holder.get("engine")
+        if eng:
+            try:
+                eng.stop()
+            except Exception:
+                pass
+        return 130
+    finally:
+        if sched:
             sched.stop()
         fh.close()
-        return 0
-
-    stats = run_once()
-    fh.close()
-    return 0 if stats else 1
 
 
 def main():
@@ -105,6 +134,7 @@ def main():
     # GUI 模式
     from .gui import App
     _fix_console_utf8()
+    _install_signal_handlers()
     App().run()
 
 

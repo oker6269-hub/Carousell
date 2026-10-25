@@ -277,11 +277,31 @@ class App:
 
     def _stop(self):
         if self.engine:
-            self.engine.stop()
-            self.log("[停止] 已请求中止（将在当前 SKU 完成后停止）")
-        if self.sched:
+            self.engine.stop()          # 置停止标志 + 立即回收 Chrome
+            self.log("[停止] 已请求中止并回收浏览器进程")
+        if getattr(self, "sched", None):
             self.sched.stop()
             self.lbl_sched.configure(text="自动更新: 关")
+
+    def _on_close(self):
+        """窗口关闭：停调度、停采集、回收浏览器与线程，再销毁窗口。"""
+        try:
+            if getattr(self, "sched", None):
+                self.sched.stop()
+        except Exception:
+            pass
+        try:
+            if self.engine:
+                self.engine.stop()
+                self.engine.kill_browser()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        finally:
+            # 兜底：确保进程退出（Chrome 子进程已被 engine/browser 回收）
+            import os
+            os._exit(0)
 
     # ---------------- auto update scheduler ----------------
 
@@ -356,4 +376,5 @@ class App:
 
     def run(self):
         self._reload_filters()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.mainloop()
