@@ -4,12 +4,15 @@
 #   Windows → dist/CarousellCollector/CarousellCollector.exe
 #   macOS   → dist/CarousellCollector.app + dist/CarousellCollector/（CLI）
 
+import os
 import sys
 from pathlib import Path
 
 block_cipher = None
 ROOT = Path(SPECPATH)
 IS_MAC = sys.platform == "darwin"
+# 交叉构建：macOS 上可通过 CC_TARGET_ARCH=x86_64 在 arm64 runner 产出 Intel 版
+TARGET_ARCH = os.environ.get("CC_TARGET_ARCH") or None
 
 a = Analysis(
     [str(ROOT / "run.py")],
@@ -43,6 +46,7 @@ exe = EXE(
     upx=False,
     console=True,          # 保留控制台：GUI 崩溃可见错误，CLI 可用
     icon=None,
+    target_arch=TARGET_ARCH,
 )
 
 coll = COLLECT(

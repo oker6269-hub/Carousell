@@ -16,14 +16,16 @@ jobs:
         include:
           - os: windows-latest
             platform: windows-x64
-            ext: zip
-          - os: macos-13        # Intel x86_64
-            platform: macos-x64
-            ext: zip
-          - os: macos-14        # Apple Silicon arm64
+            target_arch: ""
+          - os: macos-14          # Apple Silicon runner；arm64 原生构建
             platform: macos-arm64
-            ext: zip
+            target_arch: ""
+          - os: macos-14          # 同一 runner 交叉构建 Intel 版（universal2 Python）
+            platform: macos-x64
+            target_arch: x86_64
     runs-on: ${{ matrix.os }}
+    env:
+      CC_TARGET_ARCH: ${{ matrix.target_arch }}
     steps:
       - uses: actions/checkout@v4
 
@@ -42,6 +44,12 @@ jobs:
       - name: Build (PyInstaller)
         run: pyinstaller build.spec --noconfirm --distpath dist --workpath build_tmp
 
+      - name: Verify binary arch (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          file dist/CarousellCollector/CarousellCollector || true
+          lipo -info dist/CarousellCollector/CarousellCollector || true
+
       - name: Package artifact (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -51,7 +59,6 @@ jobs:
       - name: Package artifact (macOS)
         if: runner.os == 'macOS'
         run: |
-          # .app（GUI 双击启动）+ CLI 目录分别打包
           if [ -d "dist/CarousellCollector.app" ]; then
             ditto -c -k --sequesterRsrc --keepParent "dist/CarousellCollector.app" "CarousellCollector-${{ matrix.platform }}.zip"
           else
