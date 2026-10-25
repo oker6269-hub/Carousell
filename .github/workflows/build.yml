@@ -16,16 +16,15 @@ jobs:
         include:
           - os: windows-latest
             platform: windows-x64
-            target_arch: ""
-          - os: macos-14          # Apple Silicon runner；arm64 原生构建
+            optional: false
+          - os: macos-14          # Apple Silicon
             platform: macos-arm64
-            target_arch: ""
-          - os: macos-14          # 同一 runner 交叉构建 Intel 版（universal2 Python）
+            optional: false
+          - os: macos-15-intel    # Intel Mac（若 runner 不可用则跳过，不影响其余产物）
             platform: macos-x64
-            target_arch: x86_64
+            optional: true
     runs-on: ${{ matrix.os }}
-    env:
-      CC_TARGET_ARCH: ${{ matrix.target_arch }}
+    continue-on-error: ${{ matrix.optional }}
     steps:
       - uses: actions/checkout@v4
 
