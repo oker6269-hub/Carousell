@@ -154,17 +154,57 @@ class BrowserSession:
         except Exception:
             return None
 
-    def _wait_ready(self, timeout: float = 90.0) -> bool:
+    def _wait_ready(self, timeout: float = 120.0) -> bool:
+        """等待页面真正就绪：title 非挑战 + DOM 可查（商品链接或已水合的正文）。"""
         t0 = time.time()
         while time.time() - t0 < timeout:
             time.sleep(2)
+            page = None
             try:
                 for p in _pages_on(self._port):
-                    if "carousell" in p.get("url", "") and not _is_challenged(p.get("title", "")) \
-                            and "__cf_chl" not in p.get("url", ""):
+                    if "carousell" in p.get("url", ""):
+                        page = p
+                        break
+            except Exception:
+                continue
+            if not page:
+                continue
+            title = page.get("title", "")
+            if _is_challenged(title) or "__cf_chl" in page.get("url", ""):
+                continue
+            try:
+                cdp = _CDP(page["webSocketDebuggerUrl"])
+                try:
+                    r = cdp.call("Runtime.evaluate", {
+                        "expression": """JSON.stringify({
+                            ready: document.readyState,
+                            links: document.querySelectorAll('a[href*="/p/"]').length,
+                            title: document.title,
+                            body: (document.body ? document.body.innerText.length : 0)
+                        })""",
+                        "returnByValue": True}, timeout=10)
+                    st = json.loads(r.get("result", {}).get("value") or "{}")
+                    if st.get("ready") == "complete" and not _is_challenged(st.get("title", "")) \
+                            and (st.get("links", 0) > 0 or st.get("body", 0) > 200):
                         return True
+                finally:
+                    cdp.close()
             except Exception:
                 pass
+        return False
+
+    def open_seller(self, url: str, challenge_timeout: float = 120.0) -> bool:
+        """启动并等待就绪（失败自动重试一次，复用 profile 内的 clearance）。"""
+        for attempt in (1, 2):
+            if not self._launch(url):
+                self.log(f"[浏览器] 启动失败（第 {attempt} 次）")
+                continue
+            if self._wait_ready(challenge_timeout):
+                return True
+            self.log(f"[浏览器] 第 {attempt} 次未就绪（CF 挑战未完成），重试…")
+            self.close()
+            time.sleep(2)
+        self.log("[浏览器] CF 未通过（可在弹出的窗口手动完成验证后重跑）")
         return False
 
     def _navigate(self, url: str) -> bool:
@@ -182,15 +222,6 @@ class BrowserSession:
             cdp.close()
 
     # ---------- public ----------
-
-    def open_seller(self, url: str, challenge_timeout: float = 90.0) -> bool:
-        if not self._launch(url):
-            self.log("[浏览器] 启动失败")
-            return False
-        if not self._wait_ready(challenge_timeout):
-            self.log("[浏览器] CF 未通过（可能需要人工验证）")
-            return False
-        return True
 
     def current_seller(self) -> str:
         page = self._page()
@@ -243,6 +274,8 @@ class BrowserSession:
                         time.sleep(1.0)
             raw = cdp.call("Runtime.evaluate", {"expression": EXTRACT_JS, "returnByValue": True}, timeout=30)
             items = json.loads(raw.get("result", {}).get("value") or "[]")
+            if len(items) > max_items:
+                items = items[:max_items]
             self.log(f"[枚举] 完成：{len(items)} 个商品")
         except Exception as e:
             self.log(f"[枚举] 异常: {e}")

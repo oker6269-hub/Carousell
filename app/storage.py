@@ -151,6 +151,7 @@ class ExcelStore:
             widths = [14, 10, 44, 44, 10, 10, 10, 10, 16, 40, 14, 40]
             for i, w in enumerate(widths, 1):
                 ws.column_dimensions[chr(64 + i) if i <= 26 else "A" + chr(64 + i - 26)].width = w
+            ws.freeze_panes = "A2"  # 冻结表头
             wb.save(self.path)
 
     def existing_skus(self) -> set:
@@ -183,6 +184,12 @@ class ExcelStore:
                 if not sku or sku in existing:
                     continue
                 ws.append([rec.get(h, "") for h in HEADERS])
+                row_idx = ws.max_row
+                # Desc 自动换行 + 顶部对齐，便于阅读
+                for col in range(1, len(HEADERS) + 1):
+                    cell = ws.cell(row=row_idx, column=col)
+                    cell.alignment = Alignment(vertical="top",
+                                               wrap_text=(HEADERS[col - 1] in ("Desc", "Folder")))
                 existing.add(sku)
                 added += 1
             wb.save(self.path)

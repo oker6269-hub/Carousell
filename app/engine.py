@@ -34,7 +34,10 @@ class CollectorEngine:
         self.state = StateStore(str(self.root / "state.json"))
         self.filters = FilterStore(str(self.root / "filters.json"))
         self.excel = ExcelStore(str(self.root), log=log)
-        self.cf = CFSession(str(self.root / ".cf-profile"), log=log, proxy=proxy)
+        # Chrome profile 放共享目录：cf_clearance 跨任务复用，避免每次全新挑战
+        self.profile_dir = Path.home() / ".carousell-collector" / "chrome-profile"
+        self.profile_dir.mkdir(parents=True, exist_ok=True)
+        self.cf = CFSession(str(self.profile_dir), log=log, proxy=proxy)
         self.client: Optional[HttpClient] = None
         self.min_delay, self.max_delay = min_delay, max_delay
         self.img_workers = img_workers
@@ -90,7 +93,7 @@ class CollectorEngine:
 
         enum_sellers: dict[str, list[dict]] = {}
         try:
-            bs = BrowserSession(str(self.root / ".cf-profile"), log=self.log, proxy=self.proxy)
+            bs = BrowserSession(str(self.profile_dir), log=self.log, proxy=self.proxy)
             res = bs.collect_sellers(urls, max_items=self.max_items,
                                      log_progress=lambda c, t, m: self.progress(c, t, f"枚举 {m}"))
             enum_sellers = res.get("sellers", {})
