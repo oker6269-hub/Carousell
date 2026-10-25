@@ -9,7 +9,7 @@ from typing import Callable, Optional
 from .cf_session import CFSession
 from .downloader import download_sku_images
 from .http_client import HttpClient
-from .parser import parse_detail, parse_listing_cards, parse_seller_username
+from .parser import parse_detail, parse_listing_cards, parse_seller_username, parse_link_kind, parse_listing_id_from_url
 from .rules import infer_brand, infer_gender
 from .storage import ExcelStore, FilterStore, StateStore
 
@@ -89,11 +89,33 @@ class CollectorEngine:
             if self._stopped():
                 self.log("[中止] 用户停止")
                 break
-            seller = parse_seller_username(url) or url
+            kind = parse_link_kind(url)
             self.log("-" * 60)
-            self.log(f"[链接 {i}/{len(urls)}] {seller}")
             try:
-                self._collect_seller(seller, url, pending_excel)
+                if kind == "seller":
+                    seller = parse_seller_username(url) or url
+                    self.log(f"[链接 {i}/{len(urls)}] 卖家主页: {seller}")
+                    self._collect_seller(seller, url, pending_excel)
+                elif kind == "listing":
+                    lid = parse_listing_id_from_url(url)
+                    self.log(f"[链接 {i}/{len(urls)}] 单商品链接: {lid or url[:60]}")
+                    if not lid:
+                        self.log("[错误] 无法从链接提取商品 ID")
+                        continue
+                    # 断点去重（与主页采集共用 state）
+                    if self.state.status(lid) == "done":
+                        self.log(f"[增量] {lid} 已完成，跳过")
+                        continue
+                    self.progress(1, 1, lid)
+                    try:
+                        self._collect_sku(lid, {"listing_id": lid, "url": url.split("?")[0],
+                                                 "title": "", "price": None}, "", pending_excel)
+                    except Exception as e:
+                        self.log(f"[SKU] {lid} 采集失败: {e}")
+                        self.state.record(lid, "failed", error=str(e)[:200])
+                        self.stats["failed"] += 1
+                else:
+                    self.log(f"[链接 {i}/{len(urls)}] 不支持的链接格式（需 /u/ 主页或 /p/ 商品）: {url[:60]}")
             except Exception as e:
                 self.log(f"[错误] 链接采集失败: {e}")
                 traceback.print_exc()
@@ -140,7 +162,8 @@ class CollectorEngine:
 
     def _collect_sku(self, sku: str, card: dict, seller: str, pending_excel: list[dict]):
         # 详情页
-        resp = self.client.get(card["url"], timeout=40, referer=BASE + f"/u/{seller}/")
+        referer = BASE + f"/u/{seller}/" if seller else BASE + "/"
+        resp = self.client.get(card["url"], timeout=40, referer=referer)
         detail = parse_detail(resp.text, url=card["url"])
         if not detail:
             raise RuntimeError("详情页无 ld+json 数据")
@@ -148,6 +171,9 @@ class CollectorEngine:
         title = detail["name"] or card["title"]
         category = detail["category"]
         price = detail["price"] or card["price"]
+        # 卖家名兜底：详情页提取（单商品链接场景）
+        if not seller:
+            seller = detail.get("seller") or ""
 
         # 类目过滤
         if category and self.filters.should_skip(category):

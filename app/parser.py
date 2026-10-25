@@ -14,6 +14,23 @@ def parse_seller_username(url: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def parse_link_kind(url: str) -> str:
+    """判定链接类型: 'seller'（/u/ 卖家主页）/ 'listing'（/p/ 单商品）/ 'unknown'。"""
+    path = url.split("?")[0]
+    if re.search(r"/u/[A-Za-z0-9_.]+/?$", path):
+        return "seller"
+    if re.search(r"/p/[^/]+", path):
+        return "listing"
+    return "unknown"
+
+
+def parse_listing_id_from_url(url: str) -> Optional[str]:
+    """从 /p/ 商品链接提取 listing ID（链接尾部 -数字）。"""
+    path = url.split("?")[0]
+    m = re.search(r"-(\d{6,})/?$", path.rstrip("/"))
+    return m.group(1) if m else None
+
+
 def parse_listing_cards(html: str) -> list[dict]:
     """解析 profile SSR HTML 的商品卡。
 
@@ -108,8 +125,15 @@ def parse_detail(html: str, url: str = "") -> Optional[dict]:
         lid = idm.group(1)
     # 成色
     condition = "全新" if "NewCondition" in str(offers.get("itemCondition", "")) else "二手"
-    # 分类：正文「分类」区块（详情页 SSR 文本）
+    # 分类：详情页 SSR 文本（alt 属性「（分類：xxx）」优先）
     category = _detail_category(html)
+    # 卖家：图片 alt 的「由 xxx 提交」标记（单商品链接场景兜底）
+    seller = ""
+    sm = re.search(r"由\s+([A-Za-z0-9_.]{2,40})\s+提交", html)
+    if not sm:
+        sm = re.search(r"submitted by\s+([A-Za-z0-9_.]{2,40})", html, re.I)
+    if sm:
+        seller = sm.group(1)
     return {
         "listing_id": lid,
         "name": name,
@@ -119,6 +143,7 @@ def parse_detail(html: str, url: str = "") -> Optional[dict]:
         "description": desc,
         "images": images,
         "category": category,
+        "seller": seller,
     }
 
 
