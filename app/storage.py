@@ -192,5 +192,24 @@ class ExcelStore:
                                                wrap_text=(HEADERS[col - 1] in ("Desc", "Folder")))
                 existing.add(sku)
                 added += 1
-            wb.save(self.path)
-        self.log(f"[Excel] 追加 {added} 行 → {self.path.name}")
+            saved_to = self._save_with_retry(wb)
+        self.log(f"[Excel] 追加 {added} 行 → {Path(saved_to).name}")
+
+    def _save_with_retry(self, wb) -> str:
+        """保存；若文件被 Excel 打开占用，重试后另存副本。"""
+        import time as _t
+        from datetime import datetime as _dt
+
+        for attempt in range(3):
+            try:
+                wb.save(self.path)
+                return str(self.path)
+            except PermissionError:
+                if attempt < 2:
+                    self.log(f"[Excel] 文件被占用，{1.5 * (attempt + 1):.1f}s 后重试…")
+                    _t.sleep(1.5 * (attempt + 1))
+                continue
+        alt = self.path.with_name(f"{self.path.stem}_{_dt.now():%Y%m%d_%H%M%S}{self.path.suffix}")
+        wb.save(alt)
+        self.log(f"[Excel] 原文件被占用，已另存为 {alt.name}（请关闭 Excel 后合并）")
+        return str(alt)

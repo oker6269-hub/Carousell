@@ -55,7 +55,8 @@ def run_cli(args) -> int:
 
     def run_once() -> dict:
         engine = CollectorEngine(args.root, log=log, proxy=args.proxy, img_workers=args.workers,
-                                 max_items=getattr(args, "max_items", 5000))
+                                 max_items=getattr(args, "max_items", 5000),
+                                 path_style=getattr(args, "path_style", "native"))
         return engine.collect(args.urls)
 
     if args.watch_daily or args.watch:
@@ -88,6 +89,9 @@ def main():
     parser.add_argument("--workers", type=int, default=4, help="图片下载并发（默认 4）")
     parser.add_argument("--max-items", type=int, default=5000, dest="max_items",
                         help="每个卖家最多枚举商品数（默认 5000）")
+    parser.add_argument("--path-style", default="native", choices=["native", "posix", "relative"],
+                        dest="path_style",
+                        help="Excel Folder 列路径风格：native=系统绝对路径(默认) / posix=正斜杠绝对路径 / relative=仅SKU")
     parser.add_argument("--watch", type=int, default=0, metavar="MINUTES",
                         help="定时自动更新：每 N 分钟增量拉取新品（0=关闭）")
     parser.add_argument("--watch-daily", default="", metavar="HH:MM",

@@ -75,6 +75,10 @@ class App:
         ttk.Label(row3, text="每卖家上限:").pack(side="left", padx=(8, 2))
         self.var_max_items = tk.StringVar(value="5000")
         ttk.Spinbox(row3, from_=20, to=20000, increment=100, textvariable=self.var_max_items, width=7).pack(side="left", padx=4)
+        ttk.Label(row3, text="路径风格:").pack(side="left", padx=(8, 2))
+        self.var_path_style = tk.StringVar(value="native")
+        ttk.Combobox(row3, textvariable=self.var_path_style, values=["native", "posix", "relative"],
+                     width=9, state="readonly").pack(side="left")
 
         # 过滤管理
         filt = ttk.LabelFrame(self.root, text="② 类目跳过管理（持久化，保存于根路径 filters.json）")
@@ -243,9 +247,10 @@ class App:
         self.log(f"[启动] 根路径 {root} | 链接 {len(urls)} 条 | 图片并发 {workers} | 每卖家上限 {max_items}"
                  + (f" | 代理 {proxy}" if proxy else " | 直连"))
 
-        self._run_collect(urls, root, workers, proxy, max_items=max_items)
+        self._run_collect(urls, root, workers, proxy, max_items=max_items,
+                          path_style=self.var_path_style.get())
 
-    def _run_collect(self, urls, root, workers, proxy, quiet=False, max_items=5000):
+    def _run_collect(self, urls, root, workers, proxy, quiet=False, max_items=5000, path_style="native"):
         """启动一次采集线程（手动/调度共用）。"""
         if self.worker and self.worker.is_alive():
             self.log("[跳过] 采集正在进行中")
@@ -254,7 +259,7 @@ class App:
         self.btn_stop.configure(state="normal")
         self.progress.configure(value=0, maximum=100)
         self.engine = CollectorEngine(root, log=self.log, progress=self._on_progress, proxy=proxy,
-                                      img_workers=workers, max_items=max_items)
+                                      img_workers=workers, max_items=max_items, path_style=path_style)
         self.engine.filters = self.fstore
 
         def work():

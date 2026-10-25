@@ -1,13 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller spec: Carousell Collector
-# 打包: pyinstaller build.spec
-# 产物: dist/CarousellCollector/ (onedir, exe 误报率低)
+# 打包: pyinstaller build.spec --noconfirm
+#   Windows → dist/CarousellCollector/CarousellCollector.exe
+#   macOS   → dist/CarousellCollector.app + dist/CarousellCollector/（CLI）
 
 import sys
 from pathlib import Path
 
 block_cipher = None
 ROOT = Path(SPECPATH)
+IS_MAC = sys.platform == "darwin"
 
 a = Analysis(
     [str(ROOT / "run.py")],
@@ -22,7 +24,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["tkinter.test", "test", "unittest", "pydoc_data"],
+    excludes=["tkinter.test", "test", "unittest", "pydoc_data", "playwright"],
     cipher=block_cipher,
     noarchive=False,
 )
@@ -39,7 +41,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=True,          # 保留控制台: GUI 崩溃时可见错误 + 日志窗口
+    console=True,          # 保留控制台：GUI 崩溃可见错误，CLI 可用
     icon=None,
 )
 
@@ -52,3 +54,20 @@ coll = COLLECT(
     upx=False,
     name="CarousellCollector",
 )
+
+# macOS：额外产出 .app 便于双击启动
+if IS_MAC:
+    app = BUNDLE(
+        coll,
+        name="CarousellCollector.app",
+        icon=None,
+        bundle_identifier="com.carousell.collector",
+        info_plist={
+            "CFBundleName": "CarousellCollector",
+            "CFBundleDisplayName": "Carousell 采集工具",
+            "CFBundleShortVersionString": "1.0.0",
+            "NSHighResolutionCapable": True,
+            "LSMinimumSystemVersion": "11.0",
+            "LSApplicationCategoryType": "public.app-category.utilities",
+        },
+    )

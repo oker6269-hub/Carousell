@@ -21,7 +21,8 @@ class CollectorEngine:
     def __init__(self, root: str, log: Callable[[str], None] = print,
                  progress: Callable[[int, int, str], None] = lambda c, t, m: None,
                  proxy: str = "", min_delay: float = 0.6, max_delay: float = 1.6,
-                 img_workers: int = 4, detail_concurrency: int = 2, max_items: int = 5000):
+                 img_workers: int = 4, detail_concurrency: int = 2, max_items: int = 5000,
+                 path_style: str = "native"):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "logs").mkdir(exist_ok=True)
@@ -30,6 +31,8 @@ class CollectorEngine:
         self.stop_event = threading.Event()
         self.proxy = proxy
         self.max_items = max_items
+        # Folder 列的路径风格：native=系统原生绝对路径 / posix=正斜杠绝对路径 / relative=仅 SKU
+        self.path_style = path_style if path_style in ("native", "posix", "relative") else "native"
 
         self.state = StateStore(str(self.root / "state.json"))
         self.filters = FilterStore(str(self.root / "filters.json"))
@@ -162,6 +165,22 @@ class CollectorEngine:
         self.log(f"[状态] 历史累计: {c}")
         return self.stats
 
+    def _folder_value(self, sku: str) -> str:
+        """Folder 列：图片目录路径。
+
+        native   → Windows: D:\\root\\SKU ；macOS: /root/SKU（系统原生分隔符）
+        posix    → 统一正斜杠（跨平台导入 Excel / 其他系统时更安全）
+        relative → 仅 SKU（相对根路径）
+        """
+        if self.path_style == "relative":
+            return sku
+        p = (self.root / sku)
+        try:
+            p = p.resolve()
+        except Exception:
+            p = p.absolute()
+        return p.as_posix() if self.path_style == "posix" else str(p)
+
     def _collect_seller_items(self, seller: str, items: list[dict], pending_excel: list[dict]):
         """按枚举结果采集（items: [{id, path}]）。"""
         known = self.state.known_skus()
@@ -279,7 +298,7 @@ class CollectorEngine:
                 self.log(f"[SKU] {sku} 图片 {len(saved)}/{len(images)}（部分失败已重试）")
 
         # Excel 行
-        folder = str(Path(sku))
+        folder = self._folder_value(sku)
         record = {
             "SKU": sku,
             "BrowserID": "",
