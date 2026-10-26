@@ -5,10 +5,10 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Callable
 
-from .http_client import HttpClient, StopRequested
+from .http_client import ImageFetcher, StopRequested
 
 
-def download_sku_images(client: HttpClient, sku: str, images: list[str], dest_dir: str,
+def download_sku_images(client: ImageFetcher, sku: str, images: list[str], dest_dir: str,
                         log: Callable[[str], None] = print, workers: int = 4) -> list[str]:
     """下载一个 SKU 的全部图片到 dest_dir，命名 {sku}_{idx:02d}.jpg。
 
@@ -49,7 +49,7 @@ def download_sku_images(client: HttpClient, sku: str, images: list[str], dest_di
     return saved
 
 
-def _dl_one(client: HttpClient, sku: str, idx: int, url: str, d: Path,
+def _dl_one(client: ImageFetcher, sku: str, idx: int, url: str, d: Path,
             lock: threading.Lock, saved: list, log: Callable[[str], None]):
     name = f"{sku}_{idx:02d}.jpg"
     target = d / name

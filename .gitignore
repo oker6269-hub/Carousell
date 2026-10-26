@@ -10,3 +10,6 @@ test-output*/
 test-exe*/
 .cf-profile/
 *.log
+
+# local venv
+.venv/

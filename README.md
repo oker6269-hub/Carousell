@@ -4,26 +4,30 @@
 
 ## 原理
 
+**单一客户端**：枚举和详情都由同一个浏览器发出。`cf_clearance` 与签发它的客户端的
+TLS/UA 指纹绑定，导出给 curl 复用必然被判无效 —— 所以不做跨客户端搬运。
+
 ```
-① 浏览器会话（一次，用完即关）
-   Chrome（复用持久 profile，CF 通常 5-20s 通过）
+① 浏览器会话（全程只开一次，结束时关闭）
+   Chrome / CloakBrowser 定制内核（复用持久 profile，CF 通常 5-20s 通过）
    ├─ 打开卖家页 /u/{user}/（或 /p/ 商品 → 自动解析卖家 → 转主页）
    ├─ 循环点击「浏览更多」展开全部商品（每次 +20，直到耗尽）
-   ├─ 提取全部商品 ID + 链接（实测单卖家可达 3500+）
-   └─ 导出 cf_clearance 等 cookie
-② 纯协议采集（curl_cffi chrome150，直连，无需代理）
-   ├─ 详情页 /p/{slug}/   ld+json → 描述/价格/成色/图片数组/分类
-   └─ 图片   media.karousell.com  直连下载（无 CF，线程池并发）
+   ├─ 页面内并发 fetch 详情页（同源请求，cookie/UA/TLS 天然一致）
+   └─ 从内联状态 JSON 的 listingsMap 抽字段（标题/描述/价格/类目/图片/卖家）
+② 图片下载（media.karousell.com 无 CF）
+   curl_cffi 直连，线程池并发
 ③ 落盘
    ├─ {root}/{SKU}/SKU_01.jpg …
    ├─ {root}/素材保存表格.xlsx（模板 12 列，追加去重）
    └─ state.json 断点 / filters.json 类目过滤
 ```
 
-- **浏览器只负责枚举商品清单**（这是唯一必须 JS 的环节），其余全部纯协议
+- 浏览器既做枚举也做取数，全程一个身份，**不存在第二个客户端**
+- 只有图片走 curl（CDN 无 CF 防护）
 - 默认**直连免代理**；代理可选（GUI/CLI 配置）
-- 反爬应对：随机请求间隔、失败重试（指数退避）、CF 失效自动重过、failed 复跑自动重试
-- 规模参考：3500 个商品的卖家，枚举约 15 分钟，之后逐条采集详情与图片（每条约 2-5s）
+- 反爬应对：详情按批并发 + 批次间隔、失败重试（指数退避）、profile 损坏自动隔离重建
+- 规模参考（实测）：详情抓取约 4 条/秒；瓶颈是图片（每 SKU 4 并发）。
+  3500 个商品、每 SKU 6 张图，整体约 2-3 小时；调大 `--workers` 可线性缩短下图时间
 
 ## 使用（GUI）
 
@@ -37,7 +41,7 @@
 ## 使用（CLI）
 
 ```bash
-CarousellCollector.exe --root D:\materials --urls https://www.carousell.com.hk/u/xxx/ [--workers 4] [--max-items 5000] [--proxy socks5://127.0.0.1:1080]
+CarousellCollector.exe --root D:\materials --urls https://www.carousell.com.hk/u/xxx/ [--workers 4] [--detail-concurrency 4] [--max-items 5000] [--proxy socks5://127.0.0.1:1080]
 # 定时自动更新（增量拉新品）
 CarousellCollector.exe --root D:\materials --urls URL --watch 60          # 每 60 分钟
 CarousellCollector.exe --root D:\materials --urls URL --watch-daily 09:00  # 每天 09:00
@@ -152,5 +156,7 @@ git tag v1.0.2 && git push origin v1.0.2
 ## 注意
 
 - 首次运行 Chrome 窗口会自动通过 CF 验证；若弹人机验证，手动点击一次即可（60 秒宽限）
-- 采集节奏默认保守（0.6-1.6s 随机间隔），大量 SKU 时请勿调高并发以免触发风控
-- cf_clearance 与 IP/UA 绑定：换网络环境后首跑需重新过验证（自动）
+- 详情默认 4 条一批并发（`--detail-concurrency` 可调）、批间隔 0.6s（`--workers` 控图片并发）；
+  大量 SKU 时请勿盲目调高，先小批量观察是否触发风控
+- cf_clearance 与客户端指纹绑定：换网络环境后首跑需重新过验证（自动）
+- profile 若损坏（内核启动即崩），程序会自动改名隔离并用全新 profile 重建，日志里会写明路径
