@@ -17,6 +17,7 @@ import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
+from app import __version__
 from app.engine import CollectorEngine
 from app.link_library import LinkLibrary
 
@@ -392,7 +393,7 @@ class App:
         self.lbl_status = tk.Label(bar, text="就绪", bg=C_SURFACE, fg=C_FG_DIM,
                                    font=FONT_SM, anchor="w")
         self.lbl_status.pack(side="left", fill="x", expand=True, padx=22, pady=8)
-        tk.Label(bar, text="v1.0 · 单一客户端采集", bg=C_SURFACE, fg=C_FG_FAINT,
+        tk.Label(bar, text=f"v{__version__} · 单一客户端采集", bg=C_SURFACE, fg=C_FG_FAINT,
                  font=FONT_MONO_SM).pack(side="right", padx=22)
 
     # ---------------- 采集页 ----------------
