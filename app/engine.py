@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """采集引擎：多链接编排、断点增量、类目过滤、图片下载、Excel 记录、汇总。"""
 import threading
 import time
@@ -77,7 +77,8 @@ class CollectorEngine:
         cache = self.root / ".cf-session.json"
         if self.cf.load(str(cache)) and self.cf.cookies.get("cf_clearance"):
             self.client = HttpClient(self.cf, log=self.log, min_delay=self.min_delay,
-                                     max_delay=self.max_delay, refresh_fn=self._reauth_once)
+                                     max_delay=self.max_delay, refresh_fn=self._reauth_once,
+                                     stop_fn=self._stopped)
             return True
         return False
 
@@ -88,7 +89,7 @@ class CollectorEngine:
         self._reauth_done = True
         from .browser import BrowserSession
 
-        bs = BrowserSession(str(self.profile_dir), log=self.log, proxy=self.proxy)
+        bs = BrowserSession(str(self.profile_dir), log=self.log, proxy=self.proxy, stop_fn=self._stopped)
         self._browser = bs
         try:
             if not bs.open_seller(BASE + "/"):
@@ -129,7 +130,7 @@ class CollectorEngine:
         from .browser import BrowserSession
 
         enum_sellers: dict[str, list[dict]] = {}
-        bs = BrowserSession(str(self.profile_dir), log=self.log, proxy=self.proxy)
+        bs = BrowserSession(str(self.profile_dir), log=self.log, proxy=self.proxy, stop_fn=self._stopped)
         self._browser = bs
         try:
             res = bs.collect_sellers(urls, max_items=self.max_items,
@@ -149,7 +150,8 @@ class CollectorEngine:
         # ---- 2. 建立 HTTP 会话（优先浏览器 cookie，其次缓存；不再另起浏览器） ----
         if self.cf.cookies:
             self.client = HttpClient(self.cf, log=self.log, min_delay=self.min_delay,
-                                     max_delay=self.max_delay, refresh_fn=self._reauth_once)
+                                     max_delay=self.max_delay, refresh_fn=self._reauth_once,
+                                     stop_fn=self._stopped)
         elif self._load_cached_session():
             self.log("[会话] 使用缓存的 cf_clearance")
         else:
@@ -157,16 +159,24 @@ class CollectorEngine:
             return self.stats
 
         # ---- 3. 逐卖家采集 ----
+        from .http_client import StopRequested
+
         pending_excel: list[dict] = []
+        stopped_by_user = False
         if enum_sellers:
             for i, (seller, items) in enumerate(enum_sellers.items(), 1):
                 if self._stopped():
                     self.log("[中止] 用户停止")
+                    stopped_by_user = True
                     break
                 self.log("-" * 60)
                 self.log(f"[卖家 {i}/{len(enum_sellers)}] {seller}（枚举到 {len(items)} 个商品）")
                 try:
                     self._collect_seller_items(seller, items, pending_excel)
+                except StopRequested:
+                    self.log("[中止] 用户停止（已完成部分已保存）")
+                    stopped_by_user = True
+                    break
                 except Exception as e:
                     self.log(f"[错误] {seller} 采集失败: {e}")
                     traceback.print_exc()
@@ -175,6 +185,7 @@ class CollectorEngine:
             self.log("[回退] 使用 SSR 列表模式（每卖家最多首屏商品）")
             for i, url in enumerate(urls, 1):
                 if self._stopped():
+                    stopped_by_user = True
                     break
                 kind = parse_link_kind(url)
                 if kind == "seller":
@@ -184,6 +195,9 @@ class CollectorEngine:
                     if lid:
                         try:
                             self._collect_single(lid, url.split("?")[0], pending_excel)
+                        except StopRequested:
+                            stopped_by_user = True
+                            break
                         except Exception as e:
                             self.log(f"[SKU] {lid} 采集失败: {e}")
                     continue
@@ -193,15 +207,23 @@ class CollectorEngine:
                 self.log(f"[卖家 {i}/{len(urls)}] {seller}（SSR 模式）")
                 try:
                     self._collect_seller(seller, url, pending_excel)
+                except StopRequested:
+                    stopped_by_user = True
+                    break
                 except Exception as e:
                     self.log(f"[错误] 链接采集失败: {e}")
 
-        if pending_excel and not self._stopped():
-            self.excel.append(pending_excel)
+        # 停止/结束时：把已完成的行落盘（增量安全）
+        if pending_excel:
+            try:
+                self.excel.append(pending_excel)
+            except Exception as e:
+                self.log(f"[Excel] 落盘失败: {e}")
         self.log("=" * 60)
         c = self.state.counts()
+        tag = "（用户中止，已保存完成部分）" if stopped_by_user else ""
         self.log(f"[汇总] 新增 {self.stats['new']} | 类目跳过 {self.stats['skipped']} | 失败 {self.stats['failed']}"
-                 f" | 图片 {self.stats['images']} 张 | 耗时 {time.time()-t0:.0f}s")
+                 f" | 图片 {self.stats['images']} 张 | 耗时 {time.time()-t0:.0f}s {tag}")
         self.log(f"[状态] 历史累计: {c}")
         return self.stats
 
@@ -233,9 +255,11 @@ class CollectorEngine:
             self.log("[增量] 无新品")
             return
         total = len(todo)
+        from .http_client import StopRequested
+
         for idx, it in enumerate(todo, 1):
             if self._stopped():
-                break
+                raise StopRequested("用户停止")
             sku = it["id"]
             url = it.get("path") or ""
             if url.startswith("/"):
@@ -244,6 +268,8 @@ class CollectorEngine:
             try:
                 self._collect_sku(sku, {"listing_id": sku, "url": url, "title": "", "price": None},
                                   seller, pending_excel)
+            except StopRequested:
+                raise
             except Exception as e:
                 self.log(f"[SKU] {sku} 采集失败: {e}")
                 self.state.record(sku, "failed", error=str(e)[:200])

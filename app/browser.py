@@ -65,11 +65,13 @@ class BrowserSession:
 
     def __init__(self, profile_dir: str, log: Callable[[str], None] = print,
                  proxy: str = "", use_temp_profile: bool = False,
-                 browser_path: Optional[str] = None):
+                 browser_path: Optional[str] = None,
+                 stop_fn: Optional[Callable[[], bool]] = None):
         self.profile_dir = profile_dir
         self.log = log
         self.proxy = proxy
         self.use_temp_profile = use_temp_profile
+        self.stop_fn = stop_fn
         found = find_browser() or (None, "")
         self.browser_path = browser_path or found[0]
         self.browser_kind = found[1] or ("cloak" if browser_path else "chrome")
@@ -119,6 +121,9 @@ class BrowserSession:
             "--disable-background-networking",
             "--remote-allow-origins=*",   # Chromium 111+ CDP WebSocket origin 校验
         ]
+        # macOS/Linux：绕过系统 Keychain（否则 Chrome 每次启动都弹密码授权框）
+        if os.name == "posix":
+            cmd += ["--use-mock-keychain", "--password-store=basic"]
         # CloakBrowser：固定指纹种子 → 同一 profile 始终同一指纹身份（更像真人回访）
         if self.browser_kind == "cloak":
             seed = self._fingerprint_seed()
@@ -222,9 +227,12 @@ class BrowserSession:
             return None
 
     def _wait_ready(self, timeout: float = 120.0) -> bool:
-        """等待页面真正就绪：title 非挑战 + DOM 可查（商品链接或已水合的正文）。"""
+        """等待页面真正就绪：title 非挑战 + DOM 可查（商品链接或已水合的正文）。
+        停止请求时立即返回 False。"""
         t0 = time.time()
         while time.time() - t0 < timeout:
+            if self._stop_requested():
+                return False
             time.sleep(2)
             page = None
             try:
@@ -265,13 +273,22 @@ class BrowserSession:
 
         只在**进程已死**时重新拉起浏览器；进程存活则复用同一实例重试导航，
         避免重复拉起 Chrome（macOS 上反复弹窗的问题）。
+        停止请求时立即放弃（不再重试拉起）。
         """
         if not self._launch(url):
             self.log("[浏览器] 启动失败")
             return False
         for attempt in (1, 2, 3):
+            if self._stop_requested():
+                self.log("[浏览器] 用户停止，放弃等待")
+                self.close()
+                return False
             if self._wait_ready(challenge_timeout if attempt == 1 else 45):
                 return True
+            if self._stop_requested():
+                self.log("[浏览器] 用户停止，放弃重试")
+                self.close()
+                return False
             alive = self._proc is not None and self._proc.poll() is None
             if not alive:
                 self.log(f"[浏览器] 进程已退出，重新拉起（第 {attempt} 次）")
@@ -315,7 +332,7 @@ class BrowserSession:
 
     def enumerate_items(self, max_items: int = 5000, idle_rounds: int = 4,
                         click_wait: float = 1.2) -> list[dict]:
-        """展开「浏览更多」，返回 [{id, path}]。"""
+        """展开「浏览更多」，返回 [{id, path}]。停止请求时立即中断返回已展开部分。"""
         page = self._page()
         if not page:
             return []
@@ -330,6 +347,9 @@ class BrowserSession:
             for _ in range(500):
                 if last >= max_items:
                     break
+                if self._stop_requested():
+                    self.log(f"[枚举] 用户停止（已展开 {last} 个）")
+                    break
                 clicked = self._click(cdp)
                 time.sleep(click_wait)
                 cur = self._count(cdp)
@@ -340,7 +360,6 @@ class BrowserSession:
                 else:
                     idle += 1
                     if idle >= idle_rounds:
-                        # 最后确认：按钮是否还存在
                         if not self._has_more(cdp):
                             break
                         if not clicked:
@@ -359,11 +378,17 @@ class BrowserSession:
             cdp.close()
         return items
 
+    def _stop_requested(self) -> bool:
+        return bool(self.stop_fn and self.stop_fn())
+
     def _wait_hydrate(self, cdp: "_CDP", timeout: float = 20.0) -> bool:
-        """等待页面水合完成（React 挂载、商品卡渲染、『浏览更多』按钮出现）。"""
+        """等待页面水合完成（React 挂载、商品卡渲染、『浏览更多』按钮出现）。
+        停止请求时立即返回。"""
         t0 = time.time()
         ready = False
         while time.time() - t0 < timeout:
+            if self._stop_requested():
+                return ready
             try:
                 r = cdp.call("Runtime.evaluate", {"expression": """(() => {
                     const links = document.querySelectorAll('a[href*="/p/"]').length;
@@ -427,6 +452,9 @@ class BrowserSession:
                 return result
             first = True
             for i, url in enumerate(urls, 1):
+                if self._stop_requested():
+                    self.log("[浏览器] 用户停止，结束枚举")
+                    break
                 kind = parse_link_kind(url)
                 if kind == "unknown":
                     continue
