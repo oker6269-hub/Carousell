@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """采集引擎：多链接编排、断点增量、类目过滤、图片下载、Excel 记录、汇总。"""
 import threading
 import time
@@ -13,6 +13,7 @@ from .parser import (parse_detail, parse_listing_cards, parse_seller_username,
                      parse_link_kind, parse_listing_id_from_url, extract_seller_from_detail)
 from .rules import infer_brand, infer_gender
 from .storage import ExcelStore, FilterStore, StateStore
+from .link_library import LinkLibrary
 
 BASE = "https://www.carousell.com.hk"
 
@@ -48,6 +49,8 @@ class CollectorEngine:
 
         # 运行统计
         self.stats = {"new": 0, "skipped": 0, "failed": 0, "images": 0}
+        # 链接库：全局记录所有跑过的卖家（~/.carousell-collector/link_library.json）
+        self.library = LinkLibrary()
         # 退出兜底：解释器退出时确保 Chrome 被回收（macOS/Linux SIGTERM/Ctrl+C 场景）
         import atexit
         atexit.register(self.kill_browser)
@@ -163,6 +166,7 @@ class CollectorEngine:
 
         pending_excel: list[dict] = []
         stopped_by_user = False
+        per_seller_stats: dict[str, dict] = {}
         if enum_sellers:
             for i, (seller, items) in enumerate(enum_sellers.items(), 1):
                 if self._stopped():
@@ -171,15 +175,22 @@ class CollectorEngine:
                     break
                 self.log("-" * 60)
                 self.log(f"[卖家 {i}/{len(enum_sellers)}] {seller}（枚举到 {len(items)} 个商品）")
+                before = dict(self.stats)
                 try:
                     self._collect_seller_items(seller, items, pending_excel)
+                    per_seller_stats[seller] = {k: self.stats[k] - before.get(k, 0)
+                                                for k in self.stats}
                 except StopRequested:
+                    per_seller_stats[seller] = {k: self.stats[k] - before.get(k, 0)
+                                                for k in self.stats}
                     self.log("[中止] 用户停止（已完成部分已保存）")
                     stopped_by_user = True
+                    self._record_library(seller, items, per_seller_stats.get(seller, {}))
                     break
                 except Exception as e:
                     self.log(f"[错误] {seller} 采集失败: {e}")
                     traceback.print_exc()
+                self._record_library(seller, items, per_seller_stats.get(seller, {}))
         else:
             # 兜底：浏览器不可用 → SSR 列表（每卖家首屏 20 个）
             self.log("[回退] 使用 SSR 列表模式（每卖家最多首屏商品）")
@@ -242,6 +253,18 @@ class CollectorEngine:
         except Exception:
             p = p.absolute()
         return p.as_posix() if self.path_style == "posix" else str(p)
+
+    def _record_library(self, seller: str, items: list, delta: dict):
+        """把本次运行写入全局链接库。"""
+        try:
+            self.library.record(
+                seller,
+                url=f"{BASE}/u/{seller}/",
+                delta=delta,
+                total_items=len(items) if items else None,
+            )
+        except Exception as e:
+            self.log(f"[链接库] 记录失败: {e}")
 
     def _collect_seller_items(self, seller: str, items: list[dict], pending_excel: list[dict]):
         """按枚举结果采集（items: [{id, path}]）。"""
