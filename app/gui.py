@@ -1,97 +1,268 @@
 # -*- coding: utf-8 -*-
-"""GUI — shadcn/ui 设计语言（Tkinter 实现）
+"""GUI — 深色科技风（Tkinter 实现）
 
-设计 token（对照 shadcn new-york-v4）：
-- 黑白主色（zinc），radius 8px，细边框 #E4E4E7
-- muted-foreground #71717A 次要文字
-- destructive #DC2626 仅用于停止/删除
-- 深色控制台（zinc-950 底 zinc-200 字）
+设计依据（ui-ux-pro-max）：
+- 风格：Dark Mode / HUD-terminal（深空底 + 青色高光 + 等宽数字）
+- 排版：代码/工具类气质，正文 13pt 起（不堆小字），日志 12pt 等宽
+- 可访问性：正文对比度 ≥ 4.5:1、输入框聚焦有可见高光、按钮 hover 反馈
+- 不用 emoji 当图标：状态用几何符号（● ○ ■ ▶）与文字标签
 
-布局：左侧链接库 + 右侧主操作区（笔记本双页签：采集 / 链接库）
+布局：顶栏（品牌 + 内核状态）→ 页签（采集 / 链接库）→ 状态栏
+功能与旧版完全一致，只重做视觉层。
 """
 import queue
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+import tkinter.font as tkfont
+from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
 from app.engine import CollectorEngine
 from app.link_library import LinkLibrary
 
-# ---------- shadcn tokens (zinc, light) ----------
-C_BG = "#FFFFFF"          # background
-C_FG = "#09090B"          # foreground
-C_CARD = "#FFFFFF"
-C_BORDER = "#E4E4E7"      # border
-C_INPUT = "#E4E4E7"
-C_RING = "#A1A1AA"
-C_PRIMARY = "#18181B"     # zinc-900（主按钮黑）
-C_PRIMARY_FG = "#FAFAFA"
-C_SECONDARY = "#F4F4F5"   # secondary
-C_MUTED = "#F4F4F5"
-C_MUTED_FG = "#71717A"    # muted-foreground
-C_ACCENT = "#F4F4F5"
-C_DESTRUCTIVE = "#DC2626"
-C_DESTRUCTIVE_FG = "#FAFAFA"
-C_SUCCESS = "#16A34A"
-C_WARN = "#D97706"
-C_INFO = "#2563EB"
-# 控制台（dark）
-C_TERM_BG = "#09090B"
-C_TERM_FG = "#E4E4E7"
+# ---------- 设计 token（深色科技风） ----------
+C_BG = "#0A101C"          # 窗口底
+C_SURFACE = "#0E1828"     # 顶栏/状态栏
+C_CARD = "#121C30"        # 卡片
+C_CARD_HI = "#16233B"     # 卡片悬停 / 次级面
+C_MUTED_BG = "#16223A"    # 输入框/统计块底
+C_BORDER = "#22314C"      # 1px 描边
+C_BORDER_HI = "#2E4265"   # 悬停描边
+C_FG = "#E6EEF9"          # 主文字
+C_FG_DIM = "#93A7C4"      # 次要文字（对卡片 ≈ 6:1）
+C_FG_FAINT = "#6B7F9B"    # 更弱（装饰/禁用）
+C_ACCENT = "#22D3EE"      # 科技青（主操作/聚焦）
+C_ACCENT_HI = "#67E8F9"
+C_ACCENT_DIM = "#0E3A4A"  # 选中底
+C_ON_ACCENT = "#04202A"   # 青底上的文字
+C_SUCCESS = "#34D399"
+C_WARN = "#FBBF24"
+C_DANGER = "#F87171"
+C_DANGER_BG = "#3A1620"
+C_INFO = "#60A5FA"
+C_TERM_BG = "#060B14"     # 控制台
+C_TERM_FG = "#C9D7EA"
 
-FONT = ("Microsoft YaHei UI", 9)
-FONT_SM = ("Microsoft YaHei UI", 8)
-FONT_BOLD = ("Microsoft YaHei UI", 10, "bold")
-FONT_TITLE = ("Microsoft YaHei UI", 13, "bold")
-FONT_STAT = ("Microsoft YaHei UI", 15, "bold")
-MONO = ("Consolas", 9)
+# 字体族栈（按本机可用性解析；正文尺寸刻意偏大）
+UI_STACK = ["Helvetica Neue", "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Arial"]
+MONO_STACK = ["Menlo", "SF Mono", "Consolas", "DejaVu Sans Mono", "Courier New"]
+
+FONT = ("Helvetica Neue", 13)
+FONT_SM = ("Helvetica Neue", 12)
+FONT_LABEL = ("Helvetica Neue", 12)
+FONT_BOLD = ("Helvetica Neue", 13, "bold")
+FONT_H2 = ("Helvetica Neue", 15, "bold")
+FONT_TITLE = ("Helvetica Neue", 22, "bold")
+FONT_STAT = ("Menlo", 24, "bold")
+FONT_MONO = ("Menlo", 12)
+FONT_MONO_SM = ("Menlo", 11)
+FONT_TABS = ("Helvetica Neue", 14, "bold")
+
+
+def _pick(root: tk.Misc, stack: list, size: int, weight: str = "normal"):
+    try:
+        avail = set(tkfont.families(root))
+    except Exception:
+        avail = set()
+    for fam in stack:
+        if fam in avail:
+            return (fam, size, weight)
+    return (stack[-1], size, weight)
+
+
+def init_fonts(root: tk.Misc):
+    """按本机实际可用字体解析一次，全局生效。"""
+    global FONT, FONT_SM, FONT_LABEL, FONT_BOLD, FONT_H2, FONT_TITLE
+    global FONT_STAT, FONT_MONO, FONT_MONO_SM, FONT_TABS
+    FONT = _pick(root, UI_STACK, 13)
+    FONT_SM = _pick(root, UI_STACK, 12)
+    FONT_LABEL = _pick(root, UI_STACK, 12)
+    FONT_BOLD = _pick(root, UI_STACK, 13, "bold")
+    FONT_H2 = _pick(root, UI_STACK, 15, "bold")
+    FONT_TITLE = _pick(root, UI_STACK, 22, "bold")
+    FONT_STAT = _pick(root, MONO_STACK, 24, "bold")
+    FONT_MONO = _pick(root, MONO_STACK, 12)
+    FONT_MONO_SM = _pick(root, MONO_STACK, 11)
+    FONT_TABS = _pick(root, UI_STACK, 14, "bold")
+
+
+# ---------- 基础控件 ----------
 
 
 class Card(tk.Frame):
-    """shadcn Card：白底、1px 细边框、8px 圆角（Tk 用 flat 模拟）、内边距 16。"""
+    """深色卡片：1px 描边 + 标题前的青色标记条。"""
 
-    def __init__(self, parent, title: str = "", description: str = ""):
+    def __init__(self, parent, title: str = "", description: str = "", accent: str = C_ACCENT):
         super().__init__(parent, bg=C_CARD, highlightbackground=C_BORDER,
                          highlightthickness=1, bd=0)
-        self._title = title
         if title:
             head = tk.Frame(self, bg=C_CARD)
-            head.pack(fill="x", padx=16, pady=(12, 0))
-            tk.Label(head, text=title, bg=C_CARD, fg=C_FG, font=FONT_BOLD).pack(anchor="w")
+            head.pack(fill="x", padx=18, pady=(14, 0))
+            tk.Frame(head, bg=accent, width=3, height=16).pack(side="left", padx=(0, 9))
+            box = tk.Frame(head, bg=C_CARD)
+            box.pack(side="left", fill="x", expand=True)
+            tk.Label(box, text=title, bg=C_CARD, fg=C_FG, font=FONT_H2).pack(anchor="w")
             if description:
-                tk.Label(head, text=description, bg=C_CARD, fg=C_MUTED_FG,
-                         font=FONT_SM).pack(anchor="w")
+                tk.Label(box, text=description, bg=C_CARD, fg=C_FG_DIM,
+                         font=FONT_SM).pack(anchor="w", pady=(2, 0))
         self.body = tk.Frame(self, bg=C_CARD)
-        self.body.pack(fill="both", expand=True, padx=16, pady=(8, 14))
+        self.body.pack(fill="both", expand=True, padx=18, pady=(12, 16))
 
 
-def btn(parent, text, command, kind="default", **kw):
-    """shadcn Button：default(黑)/secondary/destructive/outline/ghost。"""
-    style = {
-        "default": dict(bg=C_PRIMARY, fg=C_PRIMARY_FG, activebackground="#27272A"),
-        "secondary": dict(bg=C_SECONDARY, fg=C_FG, activebackground="#E4E4E7"),
-        "destructive": dict(bg=C_DESTRUCTIVE, fg=C_DESTRUCTIVE_FG, activebackground="#B91C1C"),
-        "outline": dict(bg=C_CARD, fg=C_FG, activebackground=C_SECONDARY),
-        "ghost": dict(bg=C_CARD, fg=C_FG, activebackground=C_SECONDARY),
-    }[kind]
-    b = tk.Label(parent, text=text, font=FONT, cursor="hand2",
-                 padx=14, pady=5, **style)
-    b.bind("<Button-1>", lambda e: command())
-    b.configure(**{k: v for k, v in kw.items() if k in b.keys()})
-    return b
+class TechButton(tk.Frame):
+    """带 1px 描边的按钮：Frame 画边框、Label 画填充（深色下才看得见边界）。"""
+
+    PALETTE = {
+        "default":     dict(fill=C_ACCENT,    fg=C_ON_ACCENT, border=C_ACCENT,  hover=C_ACCENT_HI),
+        "secondary":   dict(fill=C_CARD_HI,   fg=C_FG,        border=C_BORDER,  hover=C_BORDER),
+        "outline":     dict(fill=C_CARD,      fg=C_FG,        border=C_BORDER,  hover=C_CARD_HI),
+        "ghost":       dict(fill=C_CARD,      fg=C_FG_DIM,    border=C_CARD,    hover=C_CARD_HI),
+        "destructive": dict(fill=C_DANGER_BG, fg=C_DANGER,    border="#5A2634", hover="#4A1B27"),
+    }
+
+    def __init__(self, parent, text, command, kind="default"):
+        self._p = self.PALETTE.get(kind, self.PALETTE["default"])
+        self._enabled = True
+        super().__init__(parent, bg=self._p["border"], bd=0, highlightthickness=0)
+        self.inner = tk.Label(self, text=text, font=FONT_BOLD, bg=self._p["fill"],
+                              fg=self._p["fg"], padx=16, pady=9, cursor="hand2")
+        self.inner.pack(padx=1, pady=1, fill="both", expand=True)
+        for w in (self, self.inner):
+            w.bind("<Button-1>", lambda e: command() if self._enabled else None)
+            w.bind("<Enter>", lambda e: self._hover(True))
+            w.bind("<Leave>", lambda e: self._hover(False))
+
+    def _hover(self, on: bool):
+        if self._enabled:
+            self.inner.configure(bg=self._p["hover"] if on else self._p["fill"])
+
+    def configure(self, **kw):
+        text = kw.pop("text", None)
+        if text is not None:
+            self.inner.configure(text=text)
+        if kw:
+            super().configure(**kw)
+
+    config = configure
+
+    def set_enabled(self, on: bool):
+        self._enabled = bool(on)
+        p = self._p
+        super().configure(bg=p["border"] if on else C_BORDER)
+        self.inner.configure(bg=p["fill"] if on else C_CARD_HI,
+                             fg=p["fg"] if on else C_FG_FAINT,
+                             cursor="hand2" if on else "arrow")
 
 
-def field_label(parent, text):
-    return tk.Label(parent, text=text, bg=C_CARD, fg=C_MUTED_FG, font=FONT_SM)
+def btn(parent, text, command, kind="default"):
+    return TechButton(parent, text, command, kind)
+
+
+def field_label(parent, text, bg=None):
+    return tk.Label(parent, text=text, bg=bg or C_CARD, fg=C_FG_DIM, font=FONT_LABEL)
+
+
+def entry(parent, textvariable=None, width=None, font=None):
+    e = tk.Entry(parent, textvariable=textvariable, font=font or FONT,
+                 relief="flat", bd=0, bg=C_MUTED_BG, fg=C_FG,
+                 insertbackground=C_ACCENT, insertwidth=2,
+                 highlightthickness=1, highlightbackground=C_BORDER,
+                 highlightcolor=C_ACCENT,
+                 disabledbackground=C_MUTED_BG, disabledforeground=C_FG_FAINT)
+    if width:
+        e.configure(width=width)
+    return e
+
+
+class TechProgress(tk.Canvas):
+    """细条进度：轨道 + 青色填充 + 10% 刻度；兼容 configure(value=/maximum=)。"""
+
+    def __init__(self, parent, height: int = 10, **kw):
+        super().__init__(parent, height=height, bg=C_CARD, highlightthickness=0, bd=0, **kw)
+        self._value = 0
+        self._max = 100
+        self._bar = C_ACCENT
+        self.bind("<Configure>", lambda e: self._draw())
+
+    def configure(self, **kw):
+        if "value" in kw:
+            self._value = kw.pop("value")
+        if "maximum" in kw:
+            self._max = kw.pop("maximum") or 1
+        if "bar_color" in kw:
+            self._bar = kw.pop("bar_color")
+        if kw:
+            super().configure(**kw)
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        w = max(self.winfo_width(), 1)
+        h = max(self.winfo_height(), 1)
+        self.create_rectangle(0, 0, w - 1, h - 1, fill="#1B2B47", outline=C_BORDER)
+        ratio = 0.0 if not self._max else max(0.0, min(1.0, self._value / self._max))
+        if ratio > 0:
+            self.create_rectangle(1, 1, max(2, int((w - 2) * ratio)), h - 1,
+                                  fill=self._bar, outline="")
+        for i in range(1, 10):
+            x = int(w * i / 10)
+            self.create_line(x, 0, x, h, fill=C_CARD)
+
+
+class SlimScrollbar(tk.Canvas):
+    """自绘细滚动条：原生 NSScroller 不跟主题，会突兀成白色，故自行绘制。"""
+
+    def __init__(self, parent, target, bg: str = C_CARD, **kw):
+        super().__init__(parent, width=6, bg=bg, highlightthickness=0, bd=0, **kw)
+        self.target = target
+        self._lo, self._hi = 0.0, 1.0
+        self.bind("<Configure>", lambda e: self._draw())
+        self.bind("<Button-1>", self._jump)
+        self.bind("<B1-Motion>", self._jump)
+
+    def set(self, lo, hi):
+        self._lo, self._hi = float(lo), float(hi)
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        w, h = max(self.winfo_width(), 1), max(self.winfo_height(), 1)
+        if self._hi - self._lo >= 0.999:
+            return
+        y1 = int(h * self._lo)
+        y2 = max(y1 + 24, int(h * self._hi))
+        self.create_rectangle(1, y1, max(2, w - 1), min(y2, h - 1),
+                              fill=C_ACCENT_DIM, outline="")
+        self.create_rectangle(1, y1, max(2, w - 1), min(y1 + 24, h - 1),
+                              fill=C_ACCENT, outline="")
+
+    def _jump(self, e):
+        h = max(self.winfo_height(), 1)
+        span = self._hi - self._lo
+        self.target.yview_moveto(max(0.0, min(1.0, e.y / h - span / 2)))
+
+
+class StatTile(tk.Frame):
+    """统计块：顶部色条 + 标签 + 等宽大数字。"""
+
+    def __init__(self, parent, label: str, color: str):
+        super().__init__(parent, bg=C_MUTED_BG, highlightbackground=C_BORDER,
+                         highlightthickness=1, bd=0)
+        tk.Frame(self, bg=color, height=2).pack(fill="x")
+        tk.Label(self, text=label, bg=C_MUTED_BG, fg=C_FG_DIM,
+                 font=FONT_LABEL).pack(anchor="w", padx=12, pady=(8, 0))
+        self.var = tk.StringVar(value="0")
+        tk.Label(self, textvariable=self.var, bg=C_MUTED_BG, fg=color,
+                 font=FONT_STAT).pack(anchor="w", padx=12, pady=(0, 8))
 
 
 class App:
     def __init__(self):
         self.root = tk.Tk()
+        init_fonts(self.root)
         self.root.title("Carousell SKU 素材采集")
-        self.root.geometry("1120x800")
-        self.root.minsize(940, 660)
+        self.root.geometry("1240x880")
+        self.root.minsize(1080, 720)
         self.root.configure(bg=C_BG)
         self.logq: "queue.Queue[str]" = queue.Queue()
         self.engine: Optional[CollectorEngine] = None
@@ -99,245 +270,350 @@ class App:
         self.sched = None
         self.library = LinkLibrary()
         self._stats_vars: dict[str, tk.StringVar] = {}
+        self._setup_ttk()
         self._build()
         self.root.after(150, self._poll_log)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        # mac 上让绿色按钮可用（zoom）
         try:
             self.root.resizable(True, True)
         except Exception:
             pass
 
-    # ---------------- layout ----------------
+    # ---------------- ttk 主题 ----------------
 
-    def _build(self):
-        # 顶栏
-        top = tk.Frame(self.root, bg=C_BG)
-        top.pack(fill="x", padx=16, pady=(14, 6))
-        tk.Label(top, text="Carousell 采集", bg=C_BG, fg=C_FG, font=FONT_TITLE).pack(side="left")
-        self.var_browser = tk.StringVar(value="检测浏览器中…")
-        tk.Label(top, textvariable=self.var_browser, bg=C_BG, fg=C_MUTED_FG,
-                 font=FONT_SM).pack(side="right")
-        threading.Thread(target=self._detect_browser, daemon=True).start()
-
-        # 页签（采集 / 链接库）
-        nb = ttk.Notebook(self.root)
-        nb.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+    def _setup_ttk(self):
         style = ttk.Style()
         try:
             style.theme_use("clam")
         except Exception:
             pass
-        style.configure("TNotebook", background=C_BG, borderwidth=0)
-        style.configure("TNotebook.Tab", background=C_SECONDARY, foreground=C_FG,
-                        padding=(16, 7), font=FONT)
-        style.map("TNotebook.Tab", background=[("selected", C_CARD)],
+        style.configure("TCombobox", fieldbackground=C_MUTED_BG, background=C_MUTED_BG,
+                        foreground=C_FG, arrowcolor=C_FG_DIM, bordercolor=C_BORDER,
+                        lightcolor=C_MUTED_BG, darkcolor=C_MUTED_BG,
+                        selectbackground=C_MUTED_BG, selectforeground=C_FG, padding=4)
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", C_MUTED_BG), ("disabled", C_CARD)],
+                  foreground=[("readonly", C_FG), ("disabled", C_FG_FAINT)],
+                  bordercolor=[("focus", C_ACCENT), ("active", C_BORDER_HI)])
+        style.configure("TSpinbox", fieldbackground=C_MUTED_BG, background=C_MUTED_BG,
+                        foreground=C_FG, arrowcolor=C_FG_DIM, bordercolor=C_BORDER,
+                        lightcolor=C_MUTED_BG, darkcolor=C_MUTED_BG, padding=4)
+        style.map("TSpinbox", bordercolor=[("focus", C_ACCENT)])
+        style.configure("Treeview", background=C_CARD, fieldbackground=C_CARD,
+                        foreground=C_FG, rowheight=36, font=FONT, borderwidth=0)
+        style.configure("Treeview.Heading", background=C_MUTED_BG, foreground=C_FG_DIM,
+                        font=FONT_LABEL, relief="flat", borderwidth=0, padding=(8, 8))
+        style.map("Treeview.Heading", background=[("active", C_CARD_HI)])
+        style.map("Treeview", background=[("selected", C_ACCENT_DIM)],
                   foreground=[("selected", C_FG)])
+        style.configure("Vertical.TScrollbar", background=C_BORDER, troughcolor=C_BG,
+                        bordercolor=C_BG, arrowcolor=C_FG_DIM, width=12)
+        self.root.option_add("*TCombobox*Listbox.background", C_CARD)
+        self.root.option_add("*TCombobox*Listbox.foreground", C_FG)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", C_ACCENT_DIM)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", C_FG)
 
-        page_collect = tk.Frame(nb, bg=C_BG)
-        page_library = tk.Frame(nb, bg=C_BG)
-        nb.add(page_collect, text="  采集  ")
-        nb.add(page_library, text=f"  链接库  ")
+    # ---------------- layout ----------------
 
-        self._build_collect(page_collect)
-        self._build_library(page_library)
+    def _build(self):
+        self._build_header()
+        self._build_tabs()
+        self._build_status()
+        self.root.after(60, self._detect_browser_async)
 
-        # 状态栏
-        status = tk.Frame(self.root, bg=C_BG, highlightbackground=C_BORDER,
-                          highlightthickness=1)
-        status.pack(fill="x", side="bottom")
-        self.lbl_status = tk.Label(status, text="就绪", bg=C_BG, fg=C_MUTED_FG,
+    def _build_header(self):
+        head = tk.Frame(self.root, bg=C_SURFACE)
+        head.pack(fill="x")
+        inner = tk.Frame(head, bg=C_SURFACE)
+        inner.pack(fill="x", padx=22, pady=(14, 13))
+
+        tk.Frame(inner, bg=C_ACCENT, width=6, height=36).pack(side="left", padx=(0, 12))
+        titles = tk.Frame(inner, bg=C_SURFACE)
+        titles.pack(side="left")
+        tk.Label(titles, text="CAROUSELL COLLECTOR", bg=C_SURFACE, fg=C_FG,
+                 font=(FONT_MONO[0], 15, "bold")).pack(anchor="w")
+        tk.Label(titles, text="SKU 素材采集台", bg=C_SURFACE, fg=C_FG_DIM,
+                 font=FONT_SM).pack(anchor="w")
+
+        chip = tk.Frame(inner, bg=C_MUTED_BG, highlightbackground=C_BORDER,
+                        highlightthickness=1)
+        chip.pack(side="right")
+        self.var_browser = tk.StringVar(value="检测浏览器中…")
+        self.lbl_kernel_dot = tk.Label(chip, text="●", bg=C_MUTED_BG, fg=C_FG_FAINT,
+                                       font=FONT_SM)
+        self.lbl_kernel_dot.pack(side="left", padx=(12, 6), pady=7)
+        tk.Label(chip, textvariable=self.var_browser, bg=C_MUTED_BG, fg=C_FG_DIM,
+                 font=FONT_SM).pack(side="left", padx=(0, 12), pady=7)
+
+        tk.Frame(self.root, bg=C_ACCENT, height=2).pack(fill="x")
+
+    def _build_tabs(self):
+        bar = tk.Frame(self.root, bg=C_BG)
+        bar.pack(fill="x", padx=22, pady=(14, 0))
+        self._tab_btns: dict = {}
+        self._tab_marks: dict = {}
+        self._pages: dict = {}
+
+        holder = tk.Frame(self.root, bg=C_BG)
+        holder.pack(fill="both", expand=True, padx=22, pady=(10, 0))
+
+        for key, text in (("collect", "采集"), ("library", "链接库")):
+            wrap = tk.Frame(bar, bg=C_BG)
+            wrap.pack(side="left", padx=(0, 22))
+            lab = tk.Label(wrap, text=text, bg=C_BG, fg=C_FG_DIM, font=FONT_TABS,
+                           cursor="hand2", padx=2, pady=6)
+            lab.pack()
+            mark = tk.Frame(wrap, bg=C_BG, height=2)
+            mark.pack(fill="x")
+            lab.bind("<Button-1>", lambda e, k=key: self._switch_tab(k))
+            self._tab_btns[key] = lab
+            self._tab_marks[key] = mark
+            self._pages[key] = tk.Frame(holder, bg=C_BG)
+
+        self._build_collect(self._pages["collect"])
+        self._build_library(self._pages["library"])
+        self._switch_tab("collect")
+
+    def _switch_tab(self, key: str):
+        for k, page in self._pages.items():
+            if k == key:
+                page.pack(fill="both", expand=True)
+                self._tab_btns[k].configure(fg=C_FG)
+                self._tab_marks[k].configure(bg=C_ACCENT)
+            else:
+                page.pack_forget()
+                self._tab_btns[k].configure(fg=C_FG_DIM)
+                self._tab_marks[k].configure(bg=C_BG)
+
+    def _build_status(self):
+        bar = tk.Frame(self.root, bg=C_SURFACE, highlightbackground=C_BORDER,
+                       highlightthickness=1)
+        bar.pack(fill="x", side="bottom")
+        self.lbl_status = tk.Label(bar, text="就绪", bg=C_SURFACE, fg=C_FG_DIM,
                                    font=FONT_SM, anchor="w")
-        self.lbl_status.pack(fill="x", padx=16, pady=4)
+        self.lbl_status.pack(side="left", fill="x", expand=True, padx=22, pady=8)
+        tk.Label(bar, text="v1.0 · 单一客户端采集", bg=C_SURFACE, fg=C_FG_FAINT,
+                 font=FONT_MONO_SM).pack(side="right", padx=22)
+
+    # ---------------- 采集页 ----------------
 
     def _build_collect(self, parent):
-        # 左：配置+运行；右：日志
         content = tk.Frame(parent, bg=C_BG)
         content.pack(fill="both", expand=True)
-        content.columnconfigure(0, weight=3)
-        content.columnconfigure(1, weight=2)
+        content.columnconfigure(0, weight=3, minsize=560)
+        content.columnconfigure(1, weight=2, minsize=380)
         content.rowconfigure(0, weight=1)
 
         left = tk.Frame(content, bg=C_BG)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
 
         # 卡1 配置
-        c1 = Card(left, "采集配置", "链接可混合 /u/ 主页与 /p/ 商品")
+        c1 = Card(left, "采集配置", "链接可混合 /u/ 卖家主页与 /p/ 商品")
         c1.pack(fill="x")
-        row1 = tk.Frame(c1.body, bg=C_CARD)
-        row1.pack(fill="x")
-        field_label(row1, "保存根路径").pack(side="left")
+        g = c1.body
+        g.columnconfigure(1, weight=1)
+
+        field_label(g, "保存根路径").grid(row=0, column=0, sticky="w", pady=(0, 8))
+        path_row = tk.Frame(g, bg=C_CARD)
+        path_row.grid(row=0, column=1, sticky="ew", pady=(0, 8))
+        path_row.columnconfigure(0, weight=1)
         self.var_root = tk.StringVar()
-        e = tk.Entry(row1, textvariable=self.var_root, font=FONT, relief="solid",
-                     bd=1, bg=C_CARD, fg=C_FG, insertbackground=C_FG,
-                     highlightthickness=1, highlightbackground=C_INPUT)
-        e.pack(side="left", fill="x", expand=True, padx=(8, 8))
-        btn(row1, "浏览", self._pick_root, "outline").pack(side="left")
+        entry(path_row, self.var_root).grid(row=0, column=0, sticky="ew", ipady=6)
+        btn(path_row, "浏览", self._pick_root, "outline").grid(row=0, column=1, padx=(8, 0))
 
-        row2 = tk.Frame(c1.body, bg=C_CARD)
-        row2.pack(fill="x", pady=(8, 0))
-        field_label(row2, "链接（每行一条）").pack(anchor="w")
-        self.txt_urls = tk.Text(row2, height=4, wrap="char", font=MONO,
-                                relief="solid", bd=1, bg=C_CARD, fg=C_FG,
-                                insertbackground=C_FG, highlightthickness=1,
-                                highlightbackground=C_INPUT, pady=4)
-        self.txt_urls.pack(fill="x")
+        field_label(g, "链接").grid(row=1, column=0, sticky="nw", pady=(4, 8))
+        self.txt_urls = tk.Text(g, height=4, wrap="char", font=FONT_MONO,
+                                relief="flat", bd=0, bg=C_MUTED_BG, fg=C_FG,
+                                insertbackground=C_ACCENT, insertwidth=2,
+                                highlightthickness=1, highlightbackground=C_BORDER,
+                                highlightcolor=C_ACCENT, padx=10, pady=8)
+        self.txt_urls.grid(row=1, column=1, sticky="ew", pady=(4, 8))
+        tk.Label(g, text="每行一条", bg=C_CARD, fg=C_FG_FAINT,
+                 font=FONT_MONO_SM).grid(row=2, column=1, sticky="e", pady=(0, 8))
 
-        row3 = tk.Frame(c1.body, bg=C_CARD)
-        row3.pack(fill="x", pady=(10, 0))
-        for text, var, w, opts in (
-            ("并发", "workers", 4, (1, 16, 1)),
-            ("每卖家上限", "max_items", 5000, (20, 20000, 100)),
-        ):
-            field_label(row3, text).pack(side="left")
-            sv = tk.StringVar(value=str(opts[2]))
-            setattr(self, f"var_{var}", sv)
-            ttk.Spinbox(row3, from_=opts[0], to=opts[1], increment=opts[2],
-                        textvariable=sv, width=6, font=FONT,
-                        style="TSpinbox").pack(side="left", padx=(4, 12))
-        field_label(row3, "路径").pack(side="left")
+        opts = tk.Frame(g, bg=C_CARD)
+        opts.grid(row=3, column=0, columnspan=2, sticky="ew")
+
+        field_label(opts, "图片并发").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.var_workers = tk.StringVar(value="4")
+        ttk.Spinbox(opts, from_=1, to=16, increment=1, textvariable=self.var_workers,
+                    width=5, font=FONT).grid(row=0, column=1, sticky="w", padx=(0, 18))
+
+        field_label(opts, "每卖家上限").grid(row=0, column=2, sticky="w", padx=(0, 8))
+        self.var_max_items = tk.StringVar(value="5000")
+        ttk.Spinbox(opts, from_=20, to=20000, increment=100,
+                    textvariable=self.var_max_items, width=7,
+                    font=FONT).grid(row=0, column=3, sticky="w")
+
+        field_label(opts, "Folder 路径").grid(row=1, column=0, sticky="w",
+                                              pady=(10, 0), padx=(0, 8))
         self.var_path_style = tk.StringVar(value="native")
-        cb = ttk.Combobox(row3, textvariable=self.var_path_style,
-                          values=["native", "posix", "relative"], width=8,
-                          state="readonly", font=FONT)
-        cb.pack(side="left", padx=(4, 12))
-        field_label(row3, "代理").pack(side="left")
+        ttk.Combobox(opts, textvariable=self.var_path_style,
+                     values=["native", "posix", "relative"], width=9,
+                     state="readonly", font=FONT).grid(row=1, column=1, sticky="w",
+                                                       pady=(10, 0), padx=(0, 18))
+
+        field_label(opts, "代理").grid(row=1, column=2, sticky="w", pady=(10, 0), padx=(0, 8))
         self.var_proxy = tk.StringVar()
-        tk.Entry(row3, textvariable=self.var_proxy, width=22, font=FONT, relief="solid",
-                 bd=1, bg=C_CARD, fg=C_FG, insertbackground=C_FG,
-                 highlightthickness=1, highlightbackground=C_INPUT).pack(side="left", padx=4)
+        entry(opts, self.var_proxy).grid(row=1, column=3, sticky="ew", pady=(10, 0), ipady=6)
+        opts.columnconfigure(3, weight=1)
 
         # 卡2 运行
-        c2 = Card(left, "运行", "")
-        c2.pack(fill="x", pady=(10, 0))
+        c2 = Card(left, "运行", "开始后浏览器自动过验证，日志实时回传")
+        c2.pack(fill="both", expand=True, pady=(14, 0))
+
         stats = tk.Frame(c2.body, bg=C_CARD)
         stats.pack(fill="x")
-        self._stat_chip(stats, "新增", "new", C_SUCCESS)
-        self._stat_chip(stats, "跳过", "skipped", C_WARN)
-        self._stat_chip(stats, "失败", "failed", C_DESTRUCTIVE)
-        self._stat_chip(stats, "图片", "images", C_INFO)
+        self._stat_tile(stats, "新增", "new", C_SUCCESS)
+        self._stat_tile(stats, "跳过", "skipped", C_WARN)
+        self._stat_tile(stats, "失败", "failed", C_DANGER)
+        self._stat_tile(stats, "图片", "images", C_INFO)
 
         ctrl = tk.Frame(c2.body, bg=C_CARD)
-        ctrl.pack(fill="x", pady=(10, 0))
-        self.btn_start = btn(ctrl, "▶ 开始采集", self._start, "default")
+        ctrl.pack(fill="x", pady=(14, 0))
+        self.btn_start = btn(ctrl, "▶  开始采集", self._start, "default")
         self.btn_start.pack(side="left")
-        self.btn_stop = btn(ctrl, "■ 停止", self._stop, "destructive")
-        self.btn_stop.pack(side="left", padx=8)
+        self.btn_stop = btn(ctrl, "■  停止", self._stop, "destructive")
+        self.btn_stop.pack(side="left", padx=10)
+        self.btn_stop.set_enabled(False)
 
         au = tk.Frame(c2.body, bg=C_CARD)
-        au.pack(fill="x", pady=(10, 0))
+        au.pack(fill="x", pady=(14, 0))
         self.var_auto_on = tk.BooleanVar(value=False)
-        tk.Checkbutton(au, text="自动更新", variable=self.var_auto_on, command=self._toggle_auto,
-                       bg=C_CARD, fg=C_FG, font=FONT, selectcolor=C_CARD,
-                       activebackground=C_CARD, activeforeground=C_FG).pack(side="left")
+        tk.Checkbutton(au, text="自动更新", variable=self.var_auto_on,
+                       command=self._toggle_auto, bg=C_CARD, fg=C_FG, font=FONT,
+                       selectcolor=C_MUTED_BG, activebackground=C_CARD,
+                       activeforeground=C_FG, highlightthickness=0,
+                       bd=0).pack(side="left")
         self.var_auto_mode = tk.StringVar(value="interval")
         acb = ttk.Combobox(au, textvariable=self.var_auto_mode,
-                           values=["interval", "daily"], width=8, state="readonly", font=FONT)
-        acb.pack(side="left", padx=(8, 2))
+                           values=["interval", "daily"], width=9,
+                           state="readonly", font=FONT)
+        acb.pack(side="left", padx=(10, 6))
         acb.bind("<<ComboboxSelected>>", lambda e: self._auto_mode_changed())
-        field_label(au, "间隔(分)").pack(side="left", padx=(8, 2))
+        field_label(au, "间隔(分)").pack(side="left", padx=(4, 6))
         self.var_auto_interval = tk.StringVar(value="60")
         ttk.Spinbox(au, from_=1, to=1440, textvariable=self.var_auto_interval,
-                    width=6, font=FONT).pack(side="left")
-        field_label(au, "每日").pack(side="left", padx=(8, 2))
+                    width=5, font=FONT).pack(side="left")
+        field_label(au, "每日").pack(side="left", padx=(10, 6))
         self.var_auto_daily = tk.StringVar(value="09:00")
-        tk.Entry(au, textvariable=self.var_auto_daily, width=7, font=FONT).pack(side="left")
+        entry(au, self.var_auto_daily, width=7).pack(side="left", ipady=4)
         btn(au, "立即更新", self._trigger_now, "outline").pack(side="left", padx=12)
-        self.lbl_sched = tk.Label(au, text="自动更新: 关", bg=C_CARD, fg=C_MUTED_FG, font=FONT_SM)
-        self.lbl_sched.pack(side="left")
 
-        self.progress = ttk.Progressbar(c2.body, mode="determinate", style="TProgressbar")
-        self.progress.pack(fill="x", pady=(10, 4))
-        self.lbl_progress = tk.Label(c2.body, text="就绪", bg=C_CARD, fg=C_MUTED_FG,
-                                     font=FONT_SM, anchor="w")
-        self.lbl_progress.pack(fill="x")
+        self.lbl_sched = tk.Label(c2.body, text="自动更新 · 关", bg=C_CARD, fg=C_FG_FAINT,
+                                  font=FONT_MONO_SM, anchor="w")
+        self.lbl_sched.pack(fill="x", pady=(10, 0))
+
+        self.lbl_progress = tk.Label(c2.body, text="就绪", bg=C_CARD, fg=C_FG_DIM,
+                                     font=FONT_MONO_SM, anchor="w")
+        self.lbl_progress.pack(side="bottom", fill="x", pady=(6, 0))
+        self.progress = TechProgress(c2.body, height=12)
+        self.progress.pack(side="bottom", fill="x", pady=(16, 0))
+
+        # 右列：日志（自适应）+ 类目过滤（贴底）
+        right_col = tk.Frame(content, bg=C_BG)
+        right_col.grid(row=0, column=1, sticky="nsew")
+
+        log_card = tk.Frame(right_col, bg=C_CARD, highlightbackground=C_BORDER,
+                            highlightthickness=1)
+        log_card.pack(fill="both", expand=True)
+        rt = tk.Frame(log_card, bg=C_CARD)
+        rt.pack(fill="x", padx=18, pady=(14, 10))
+        tk.Frame(rt, bg=C_ACCENT, width=3, height=16).pack(side="left", padx=(0, 9))
+        tk.Label(rt, text="运行日志", bg=C_CARD, fg=C_FG, font=FONT_H2).pack(side="left")
+        tk.Label(rt, text="● LIVE", bg=C_CARD, fg=C_SUCCESS,
+                 font=FONT_MONO_SM).pack(side="right")
+
+        log_wrap = tk.Frame(log_card, bg=C_TERM_BG, highlightthickness=1,
+                            highlightbackground=C_BORDER)
+        log_wrap.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        self.txt_log = tk.Text(log_wrap, state="disabled", font=FONT_MONO, bg=C_TERM_BG,
+                               fg=C_TERM_FG, insertbackground=C_TERM_FG, relief="flat",
+                               bd=0, selectbackground=C_ACCENT_DIM, selectforeground=C_FG,
+                               padx=14, pady=12, wrap="word", highlightthickness=0)
+        vsb = SlimScrollbar(log_wrap, self.txt_log, bg=C_TERM_BG)
+        self.txt_log.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y", padx=(6, 6), pady=8)
+        self.txt_log.pack(side="left", fill="both", expand=True)
+        for tag, fg in (("ok", C_SUCCESS), ("warn", C_WARN), ("err", C_DANGER),
+                        ("phase", C_INFO), ("dim", "#7C8FA8")):
+            self.txt_log.tag_config(tag, foreground=fg)
+        self.txt_log.tag_config("phase", font=(FONT_MONO[0], 12, "bold"))
 
         # 卡3 类目过滤
-        c3 = Card(left, "类目跳过", "持久化于根路径 filters.json")
-        c3.pack(fill="both", expand=True, pady=(10, 0))
-        frow = tk.Frame(c3.body, bg=C_CARD)
-        frow.pack(fill="x")
+        c3 = Card(right_col, "类目跳过", "持久化在根路径 filters.json")
+        c3.pack(fill="x", pady=(14, 0))
+        b = c3.body
+        b.columnconfigure(1, weight=1)
         self.var_skip_on = tk.BooleanVar(value=True)
-        tk.Checkbutton(frow, text="启用", variable=self.var_skip_on, command=self._toggle_skip,
-                       bg=C_CARD, fg=C_FG, font=FONT, selectcolor=C_CARD,
-                       activebackground=C_CARD, activeforeground=C_FG).pack(side="left")
+        tk.Checkbutton(b, text="启用", variable=self.var_skip_on,
+                       command=self._toggle_skip, bg=C_CARD, fg=C_FG, font=FONT,
+                       selectcolor=C_MUTED_BG, activebackground=C_CARD,
+                       activeforeground=C_FG, highlightthickness=0,
+                       bd=0).grid(row=0, column=0, sticky="w")
         self.var_newcat = tk.StringVar()
-        tk.Entry(frow, textvariable=self.var_newcat, width=12, font=FONT, relief="solid",
-                 bd=1, bg=C_CARD, fg=C_FG, insertbackground=C_FG,
-                 highlightthickness=1, highlightbackground=C_INPUT).pack(side="left", padx=8)
-        btn(frow, "添加", self._add_cat, "outline").pack(side="left")
-        btn(frow, "开/关", self._toggle_cat, "ghost").pack(side="left", padx=6)
-        btn(frow, "删除", self._del_cat, "ghost").pack(side="left")
-        self.lst_cats = tk.Listbox(c3.body, height=3, font=FONT, relief="flat",
-                                   bg=C_MUTED, fg=C_FG, selectbackground="#D4D4D8",
-                                   highlightthickness=0, activestyle="none")
-        self.lst_cats.pack(fill="both", expand=True, pady=(8, 0))
+        entry(b, self.var_newcat).grid(row=0, column=1, sticky="ew", padx=10, ipady=5)
+        btn(b, "添加", self._add_cat, "outline").grid(row=0, column=2)
 
-        # 右：日志控制台
-        right = Card(content, "日志")
-        right.grid(row=0, column=1, sticky="nsew")
-        self.txt_log = scrolledtext.ScrolledText(right.body, state="disabled", font=MONO,
-                                                 bg=C_TERM_BG, fg=C_TERM_FG,
-                                                 insertbackground=C_TERM_FG,
-                                                 relief="flat", selectbackground="#27272A",
-                                                 wrap="word")
-        self.txt_log.pack(fill="both", expand=True)
-        for tag, fg in (("ok", "#4ADE80"), ("warn", "#FACC15"), ("err", "#F87171"),
-                        ("phase", "#93C5FD"), ("dim", "#71717A")):
-            self.txt_log.tag_config(tag, foreground=fg)
+        self.lst_cats = tk.Listbox(b, height=3, font=FONT, relief="flat", bd=0,
+                                   bg=C_MUTED_BG, fg=C_FG,
+                                   selectbackground=C_ACCENT_DIM, selectforeground=C_FG,
+                                   highlightthickness=1, highlightbackground=C_BORDER,
+                                   activestyle="none", selectborderwidth=0,
+                                   borderwidth=0)
+        self.lst_cats.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+
+        fbtns = tk.Frame(b, bg=C_CARD)
+        fbtns.grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        btn(fbtns, "开 / 关", self._toggle_cat, "ghost").pack(side="left")
+        btn(fbtns, "删除", self._del_cat, "ghost").pack(side="left", padx=8)
+
+    def _stat_tile(self, parent, label, key, color):
+        tile = StatTile(parent, label, color)
+        tile.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self._stats_vars[key] = tile.var
+
+    # ---------------- 链接库页 ----------------
 
     def _build_library(self, parent):
-        """链接库页：所有跑过的卖家 + 统计 + 启停 + 一键重跑。"""
         wrap = tk.Frame(parent, bg=C_BG)
         wrap.pack(fill="both", expand=True)
         wrap.columnconfigure(0, weight=1)
         wrap.rowconfigure(0, weight=1)
 
-        card = Card(wrap, "链接库", "所有运行过的卖家自动记录于此（全局共享 ~/.carousell-collector/link_library.json）")
+        card = Card(wrap, "链接库",
+                    "所有运行过的卖家自动记录于此（全局共享 ~/.carousell-collector/link_library.json）")
         card.grid(row=0, column=0, sticky="nsew")
 
-        # 工具行
         bar = tk.Frame(card.body, bg=C_CARD)
         bar.pack(fill="x")
-        btn(bar, "↻ 刷新", self._render_library, "outline").pack(side="left")
-        btn(bar, "＋ 从链接库全选采集", self._collect_all_enabled, "default").pack(side="left", padx=8)
+        btn(bar, "↻  刷新", self._render_library, "outline").pack(side="left")
+        btn(bar, "＋  全选采集", self._collect_all_enabled, "default").pack(side="left", padx=10)
         btn(bar, "开关选中", self._toggle_lib_entry, "secondary").pack(side="left")
-        btn(bar, "删除选中", self._remove_lib_entry, "ghost").pack(side="left", padx=6)
-        self.lbl_lib_count = tk.Label(bar, text="", bg=C_CARD, fg=C_MUTED_FG, font=FONT_SM)
+        btn(bar, "删除选中", self._remove_lib_entry, "ghost").pack(side="left", padx=8)
+        self.lbl_lib_count = tk.Label(bar, text="", bg=C_CARD, fg=C_FG_DIM, font=FONT_MONO_SM)
         self.lbl_lib_count.pack(side="right")
 
-        # 表格
+        table = tk.Frame(card.body, bg=C_CARD)
+        table.pack(fill="both", expand=True, pady=(12, 0))
+        table.columnconfigure(0, weight=1)
+        table.rowconfigure(0, weight=1)
+
         cols = ("seller", "items", "runs", "new", "imgs", "last_run", "on")
         headings = ("卖家", "商品数", "次数", "上次新增", "图片", "最近运行", "状态")
-        widths = (170, 70, 60, 80, 70, 150, 60)
-        self.tree = ttk.Treeview(card.body, columns=cols, show="headings", height=16)
+        widths = (200, 80, 70, 90, 80, 160, 70)
+        self.tree = ttk.Treeview(table, columns=cols, show="headings", height=16)
         for c, h, w in zip(cols, headings, widths):
             self.tree.heading(c, text=h)
-            self.tree.column(c, width=w, anchor="w" if c in ("seller", "last_run") else "center")
-        vsb = ttk.Scrollbar(card.body, orient="vertical", command=self.tree.yview)
+            self.tree.column(c, width=w,
+                             anchor="w" if c in ("seller", "last_run") else "center")
+        vsb = SlimScrollbar(table, self.tree)
         self.tree.configure(yscrollcommand=vsb.set)
-        style = ttk.Style()
-        style.configure("Treeview", font=FONT, rowheight=30, background=C_CARD,
-                        foreground=C_FG, fieldbackground=C_CARD, borderwidth=0)
-        style.configure("Treeview.Heading", font=FONT_SM, background=C_MUTED,
-                        foreground=C_MUTED_FG, relief="flat")
-        style.map("Treeview", background=[("selected", "#D4D4D8")])
-        style.configure("Vertical.TScrollbar", background=C_BORDER, troughcolor=C_BG,
-                        borderwidth=0, arrowsize=12)
-        self.tree.pack(fill="both", expand=True, side="left", pady=(8, 0))
-        vsb.pack(fill="y", side="right", pady=(8, 0))
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns", padx=(6, 6), pady=6)
 
-        # 双击行 = 填入采集页
         self.tree.bind("<Double-1>", self._lib_row_dblclick)
         self._render_library()
-
-    def _stat_chip(self, parent, label, key, color):
-        chip = tk.Frame(parent, bg=C_MUTED, highlightthickness=0)
-        chip.pack(side="left", padx=(0, 10))
-        tk.Label(chip, text=label, bg=C_MUTED, fg=C_MUTED_FG, font=FONT_SM).pack(anchor="w", padx=8, pady=(5, 0))
-        v = tk.StringVar(value="0")
-        self._stats_vars[key] = v
-        tk.Label(chip, textvariable=v, bg=C_MUTED, fg=color, font=FONT_STAT).pack(anchor="w", padx=8, pady=(0, 5))
 
     # ---------------- library ----------------
 
@@ -354,7 +630,7 @@ class App:
                 stats.get("new", "—"),
                 stats.get("images", "—"),
                 str(e.get("last_run", ""))[:16].replace("T", " "),
-                "启用" if e.get("enabled", True) else "停用",
+                "● 启用" if e.get("enabled", True) else "○ 停用",
             ))
         self.lbl_lib_count.configure(text=f"{len(entries)} 个卖家")
 
@@ -395,21 +671,31 @@ class App:
 
     # ---------------- browser detect ----------------
 
+    def _detect_browser_async(self):
+        threading.Thread(target=self._detect_browser, daemon=True).start()
+
     def _detect_browser(self):
         try:
             from app.cf_session import find_browser, find_cloakbrowser
             from pathlib import Path
             cb = find_cloakbrowser()
             if cb:
-                ver = Path(cb).parent.name.replace("chromium-", "")
-                self.var_browser.set(f"内核：CloakBrowser v{ver} · 指纹伪装")
+                ver = ""
+                for part in Path(cb).parts:
+                    if part.startswith("chromium-"):
+                        ver = part.replace("chromium-", "")
+                        break
+                self.var_browser.set(f"内核 CloakBrowser v{ver} · 指纹伪装")
+                self.root.after(0, lambda: self.lbl_kernel_dot.configure(fg=C_SUCCESS))
             else:
                 found = find_browser()
                 if found:
                     kind = {"chrome": "Chrome", "edge": "Edge"}.get(found[1], found[1])
-                    self.var_browser.set(f"内核：{kind}（建议安装 CloakBrowser）")
+                    self.var_browser.set(f"内核 {kind}（建议安装 CloakBrowser）")
+                    self.root.after(0, lambda: self.lbl_kernel_dot.configure(fg=C_WARN))
                 else:
                     self.var_browser.set("未找到浏览器内核")
+                    self.root.after(0, lambda: self.lbl_kernel_dot.configure(fg=C_DANGER))
         except Exception:
             pass
 
@@ -485,7 +771,7 @@ class App:
     def _render_cats(self):
         self.lst_cats.delete(0, "end")
         for name, on in self.fstore.categories().items():
-            self.lst_cats.insert("end", f"{'✅ 跳过' if on else '⛔ 采集'}  {name}")
+            self.lst_cats.insert("end", f"{'● 跳过' if on else '○ 采集'}  {name}")
 
     def _toggle_skip(self):
         try:
@@ -536,23 +822,33 @@ class App:
 
         self._reset_stats()
         self.log("=" * 56)
-        self.log(f"[启动] 根路径 {root} | 链接 {len(urls)} 条 | 并发 {workers} | 上限 {max_items}"
+        self.log(f"[启动] 根路径 {root} | 链接 {len(urls)} 条 | 图片并发 {workers} | 上限 {max_items}"
                  + (f" | 代理 {proxy}" if proxy else " | 直连"))
-        self.lbl_status.configure(text="采集中…", fg=C_INFO)
+        self.lbl_status.configure(text="采集中…", fg=C_ACCENT)
         self._run_collect(urls, root, workers, proxy, max_items=max_items,
                           path_style=self.var_path_style.get())
+
+    def _set_running(self, running: bool):
+        if running:
+            self.btn_start.set_enabled(False)
+            self.btn_start.configure(text="▶  采集中…")
+            self.btn_stop.set_enabled(True)
+            self.progress.configure(value=0, maximum=100, bar_color=C_ACCENT)
+        else:
+            self.btn_start.set_enabled(True)
+            self.btn_start.configure(text="▶  开始采集")
+            self.btn_stop.set_enabled(False)
 
     def _run_collect(self, urls, root, workers, proxy, quiet=False,
                      max_items=5000, path_style="native"):
         if self.worker and self.worker.is_alive():
             self.log("[跳过] 采集正在进行中")
             return
-        self.btn_start.configure(bg="#A1A1AA")
-        self.btn_stop.configure(state="normal")
+        self._set_running(True)
         self.progress.configure(value=0, maximum=100)
         self.engine = CollectorEngine(root, log=self.log, progress=self._on_progress,
-                                       proxy=proxy, img_workers=workers,
-                                       max_items=max_items, path_style=path_style)
+                                      proxy=proxy, img_workers=workers,
+                                      max_items=max_items, path_style=path_style)
         self.engine.filters = self.fstore
 
         def work():
@@ -562,8 +858,8 @@ class App:
                 self.log(f"[异常] {e}")
             finally:
                 self.log("[结束] 采集线程退出")
-                self.root.after(0, lambda: self.btn_start.configure(bg=C_PRIMARY))
-                self.root.after(0, lambda: self.lbl_status.configure(text="就绪", fg=C_MUTED_FG))
+                self.root.after(0, lambda: self._set_running(False))
+                self.root.after(0, lambda: self.lbl_status.configure(text="就绪", fg=C_FG_DIM))
 
         self.worker = threading.Thread(target=work, daemon=True)
         self.worker.start()
@@ -572,10 +868,10 @@ class App:
         if self.engine:
             self.engine.stop()
             self.log("[停止] 已请求中止并回收浏览器进程")
-            self.lbl_status.configure(text="已停止", fg=C_DESTRUCTIVE)
+            self.lbl_status.configure(text="已停止", fg=C_DANGER)
         if getattr(self, "sched", None):
             self.sched.stop()
-            self.lbl_sched.configure(text="自动更新: 关")
+            self.lbl_sched.configure(text="自动更新 · 关")
 
     def _on_progress(self, cur, total, msg):
         def upd():
@@ -592,7 +888,7 @@ class App:
         else:
             if getattr(self, "sched", None):
                 self.sched.stop()
-            self.lbl_sched.configure(text="自动更新: 关")
+            self.lbl_sched.configure(text="自动更新 · 关")
 
     def _auto_mode_changed(self):
         if self.var_auto_on.get():
@@ -640,8 +936,8 @@ class App:
                 try:
                     nr = self.sched.next_run
                     self.lbl_sched.configure(
-                        text=f"自动更新: 开 | {mode} | 下次 {nr:%m-%d %H:%M}" if nr
-                        else f"自动更新: 开 | {mode}")
+                        text=f"自动更新 · 开 | {mode} | 下次 {nr:%m-%d %H:%M}" if nr
+                        else f"自动更新 · 开 | {mode}")
                 except Exception:
                     pass
                 import time as _t
