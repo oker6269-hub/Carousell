@@ -25,33 +25,68 @@ except ImportError:  # pragma: no cover
 CHALLENGE_MARKS = ("just a moment", "請稍候", "请稍候", "moments", "checking your browser", "安全验证", "安全驗證")
 
 
-def find_browser() -> Optional[str]:
-    """定位可用的 Chromium 浏览器（Chrome 优先，其次 Edge）。"""
+def find_cloakbrowser() -> Optional[str]:
+    """定位 CloakBrowser 定制 Chromium（源码级指纹伪装，过 CF 更稳）。
+
+    安装位置：~/.cloakbrowser/chromium-<ver>/ 下的可执行文件。
+    """
+    root = Path.home() / ".cloakbrowser"
+    if not root.is_dir():
+        return None
+    names = ("chrome", "chrome.exe", "Chromium", "Chromium.app/Contents/MacOS/Chromium")
+    # 版本号倒序：优先最新
+    dirs = sorted([d for d in root.iterdir() if d.is_dir() and d.name.startswith("chromium-")],
+                  reverse=True)
+    for d in dirs:
+        for n in names:
+            exe = d / n
+            if exe.exists():
+                return str(exe)
+        # macOS bundle 形态
+        for app in d.glob("*.app"):
+            exe = app / "Contents" / "MacOS" / (app.stem or "Chromium")
+            if exe.exists():
+                return str(exe)
+    return None
+
+
+def find_browser(prefer_cloak: bool = True) -> Optional[tuple[str, str]]:
+    """定位可用浏览器。返回 (路径, 类型)。
+
+    类型：cloak（CloakBrowser 定制内核，带指纹伪装） / chrome / edge
+    优先级：CloakBrowser > Chrome > Edge
+    """
     import platform
+
+    if prefer_cloak:
+        cb = find_cloakbrowser()
+        if cb:
+            return cb, "cloak"
 
     candidates = []
     if platform.system() == "Windows":
         candidates = [
-            Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-            Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
-            Path.home() / r"AppData\Local\Google\Chrome\Application\chrome.exe",
-            Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
-            Path(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
+            (Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"), "chrome"),
+            (Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"), "chrome"),
+            (Path.home() / r"AppData\Local\Google\Chrome\Application\chrome.exe", "chrome"),
+            (Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"), "edge"),
+            (Path(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"), "edge"),
         ]
     elif platform.system() == "Darwin":
         candidates = [
-            Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
-            Path("/Applications/Chromium.app/Contents/MacOS/Chromium"),
-            Path("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+            (Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"), "chrome"),
+            (Path("/Applications/Chromium.app/Contents/MacOS/Chromium"), "chrome"),
+            (Path("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"), "edge"),
         ]
     else:
-        for name in ("google-chrome", "chromium", "chromium-browser", "microsoft-edge"):
+        for name, kind in (("google-chrome", "chrome"), ("chromium", "chrome"),
+                           ("chromium-browser", "chrome"), ("microsoft-edge", "edge")):
             p = shutil.which(name)
             if p:
-                candidates.append(Path(p))
-    for c in candidates:
+                candidates.append((Path(p), kind))
+    for c, kind in candidates:
         if c.exists():
-            return str(c)
+            return str(c), kind
     return None
 
 
@@ -127,7 +162,7 @@ class CFSession:
         self.profile_dir = str(Path(profile_dir).resolve())
         self.log = log
         self.proxy = proxy
-        self.browser_path = find_browser()
+        self.browser_path, self.browser_kind = find_browser() or (None, "")
         self._proc: Optional[subprocess.Popen] = None
         self._port = 0
         self.cookies: dict[str, str] = {}

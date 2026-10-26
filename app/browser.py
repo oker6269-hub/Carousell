@@ -23,7 +23,6 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .cf_session import _CDP, _pages_on, _wait_port, find_browser, _is_challenged
-
 CLICK_JS = """(() => {
     const els = Array.from(document.querySelectorAll('button, [role=button]'));
     const more = els.find(e => /浏览更多|瀏覽更多|load more|view more|查看更多/i.test(e.textContent || ''));
@@ -65,12 +64,15 @@ class BrowserSession:
     """短生命周期浏览器会话。"""
 
     def __init__(self, profile_dir: str, log: Callable[[str], None] = print,
-                 proxy: str = "", use_temp_profile: bool = False):
+                 proxy: str = "", use_temp_profile: bool = False,
+                 browser_path: Optional[str] = None):
         self.profile_dir = profile_dir
         self.log = log
         self.proxy = proxy
         self.use_temp_profile = use_temp_profile
-        self.browser_path = find_browser()
+        found = find_browser() or (None, "")
+        self.browser_path = browser_path or found[0]
+        self.browser_kind = found[1] or ("cloak" if browser_path else "chrome")
         self._proc: Optional[subprocess.Popen] = None
         self._port = 0
         self._temp_profile: Optional[str] = None
@@ -101,7 +103,7 @@ class BrowserSession:
 
     def _launch(self, url: str) -> bool:
         if not self.browser_path:
-            self.log("[浏览器] 未找到 Chrome/Edge，请安装 Google Chrome")
+            self.log("[浏览器] 未找到 Chrome/Edge/CloakBrowser，请安装 Google Chrome")
             return False
         self.close()
         self._kill_stale()
@@ -115,10 +117,19 @@ class BrowserSession:
             "--window-size=1000,780",
             "--disable-session-crashed-bubble", "--hide-crash-restore-bubble",
             "--disable-background-networking",
-            url,
+            "--remote-allow-origins=*",   # Chromium 111+ CDP WebSocket origin 校验
         ]
+        # CloakBrowser：固定指纹种子 → 同一 profile 始终同一指纹身份（更像真人回访）
+        if self.browser_kind == "cloak":
+            seed = self._fingerprint_seed()
+            cmd.append(f"--fingerprint={seed}")
+            self.log(f"[浏览器] CloakBrowser 内核（指纹种子 {seed[:8]}…）")
+        else:
+            self.log(f"[浏览器] {'Chrome' if self.browser_kind == 'chrome' else 'Edge'} 内核"
+                     + ("（建议安装 CloakBrowser 提升反检测能力）" if self.browser_kind != "cloak" else ""))
         if self.proxy:
             cmd.append(f"--proxy-server={self.proxy}")
+        cmd.append(url)
         # POSIX：独立会话，便于整组回收（Chrome 会派生多个子进程）
         kwargs = {"start_new_session": True} if os.name == "posix" else {}
         self._proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
@@ -130,6 +141,24 @@ class BrowserSession:
         self.close()
         self._clear_profile_locks()
         return False
+
+    def _fingerprint_seed(self) -> str:
+        """稳定指纹种子：存 profile 目录（.cloakbrowser-seed），跨次运行同一身份。"""
+        import hashlib
+
+        seed_file = Path(self.profile_dir) / ".cloakbrowser-seed"
+        if seed_file.exists():
+            try:
+                return seed_file.read_text(encoding="utf-8").strip()
+            except Exception:
+                pass
+        seed = hashlib.sha256(str(self.profile_dir).encode()).hexdigest()[:16]
+        try:
+            seed_file.parent.mkdir(parents=True, exist_ok=True)
+            seed_file.write_text(seed, encoding="utf-8")
+        except Exception:
+            pass
+        return seed
 
     def _kill_stale(self):
         """清理上次异常退出残留的、使用我们 profile 的 Chrome 进程。"""
