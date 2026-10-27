@@ -648,8 +648,10 @@ class App:
         foot.grid(row=2, column=0, columnspan=5, sticky="ew", pady=(8, 0))
         btn(foot, "开 / 关", self._toggle_title_rule, "ghost").pack(side="left")
         btn(foot, "删除", self._del_title_rule, "ghost").pack(side="left", padx=8)
+        btn(foot, "↑ 上移", lambda: self._move_title_rule(-1), "ghost").pack(side="left")
+        btn(foot, "↓ 下移", lambda: self._move_title_rule(1), "ghost").pack(side="left", padx=8)
         btn(foot, "恢复默认", self._reset_title_rules, "ghost").pack(side="left")
-        tk.Label(foot, text="title_rules.json", bg=C_CARD, fg=C_FG_FAINT,
+        tk.Label(foot, text="自上而下执行", bg=C_CARD, fg=C_FG_FAINT,
                  font=FONT_MONO_SM).pack(side="right")
         self._render_title_rules()
 
@@ -682,6 +684,18 @@ class App:
         if sel:
             self.tstore.toggle(sel[0])
             self._render_title_rules()
+
+    def _move_title_rule(self, delta: int):
+        sel = self.lst_title.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        self.tstore.move(idx, delta)
+        self._render_title_rules()
+        new = idx + delta
+        if 0 <= new < self.lst_title.size():
+            self.lst_title.selection_set(new)
+            self.lst_title.see(new)
 
     def _del_title_rule(self):
         sel = self.lst_title.curselection()

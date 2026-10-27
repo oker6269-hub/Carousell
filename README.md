@@ -95,7 +95,8 @@ CarousellCollector.exe --root D:\materials --urls URL --watch-daily 09:00  # 每
 
 - 配置位置：`~/.carousell-collector/title_rules.json`（**全局**，所有 root 共用）
 - GUI 里在「采集」页右下角的 **规则 → 标题清洗** 里增删/开关，带「恢复默认」
-- 规则按顺序逐条 `re.sub`，最后合并多余空格、去掉首尾空白
+- 规则**自上而下**逐条 `re.sub`，顺序会影响结果（GUI 里可以用 ↑/↓ 调整）
+- 默认前缀规则用「重复组」写成可叠加形式，`全新正貨` / `原裝有盒` / `全新有盒` 都能一次清干净
 - 正则写错不会中断采集：该条跳过并写日志；「添加」时会先校验并提示
 - 内置默认两条：去掉「原裝有盒 / 全新有盒 / 原裝 / 全新 / 二手 / 有盒…」前缀、去掉结尾标点
 
@@ -114,6 +115,16 @@ CarousellCollector.exe --root D:\materials --urls URL --watch-daily 09:00  # 每
 
 清洗只影响 `ProductNameCn`（以及 `state.json` 里的 title），`Desc`、价格、图片目录不变；
 品牌/性别推断用的也是清洗后的标题。
+
+### 修规则后，已有表格可以重新清洗
+
+改了规则之后，历史行不会自动回填。用这个工具重洗（默认只预览，`--apply` 才写入，
+写入前会生成 `素材保存表格.xlsx.bak-<时间戳>`）：
+
+```bash
+python tools/fix_titles.py /Users/max/carousell/新品采集10_25            # 预览
+python tools/fix_titles.py /Users/max/carousell/新品采集10_25 --apply    # 写入
+```
 
 ## 断点 / 增量 / 定时更新
 

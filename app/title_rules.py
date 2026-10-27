@@ -20,10 +20,15 @@ import threading
 from pathlib import Path
 from typing import Callable, Optional
 
+# 旧版默认规则（用于配置迁移）
+LEGACY_PREFIX_PATTERN = r"^\s*(?:原裝有盒|全新有盒|原裝|全新|二手|近全新|有盒|無盒|冇盒)\s*"
+
 DEFAULT_RULES = [
     {
-        "name": "去掉成色/包裝前綴",
-        "pattern": r"^\s*(?:原裝有盒|全新有盒|原裝|全新|二手|近全新|有盒|無盒|冇盒)\s*",
+        # 用「重复组」而不是罗列组合：全新正貨 / 原裝有盒 / 全新有盒 都能一次吃干净，
+        # 否则单条 全新 先命中会把 全新正貨 拆成 正貨（v1.4.x 的 bug）
+        "name": "去掉成色/包裝前綴（可疊加：全新正貨、原裝有盒…）",
+        "pattern": r"^\s*(?:(?:原裝|全新|近全新|二手|九成新|正貨|正品|有盒|無盒|冇盒|未拆|未開封)\s*)+",
         "replace": "",
     },
     {
@@ -72,6 +77,18 @@ class TitleRules:
                     })
             self._data["rules"] = cleaned
         self._data["enabled"] = bool(data.get("enabled", True))
+        if self._migrate_legacy_prefix():
+            self._save()
+
+    def _migrate_legacy_prefix(self) -> bool:
+        """把旧默认前缀规则升级成可叠加版本（只改这一条，不动用户规则）。"""
+        for r in self._data.get("rules", []):
+            if r.get("pattern") == LEGACY_PREFIX_PATTERN:
+                r["pattern"] = DEFAULT_RULES[0]["pattern"]
+                r["name"] = DEFAULT_RULES[0]["name"]
+                self.log("[标题清洗] 已升级内置前缀规则（支持 全新正貨 这类叠加词）")
+                return True
+        return False
 
     def _save(self):
         try:
@@ -127,6 +144,15 @@ class TitleRules:
             rules = self._data.get("rules", [])
             if 0 <= index < len(rules):
                 rules.pop(index)
+                self._save()
+
+    def move(self, index: int, delta: int):
+        """调整规则顺序：规则自上而下执行，顺序会影响结果。"""
+        with self._lock:
+            rules = self._data.get("rules", [])
+            target = index + delta
+            if 0 <= index < len(rules) and 0 <= target < len(rules):
+                rules[index], rules[target] = rules[target], rules[index]
                 self._save()
 
     def toggle(self, index: int):
