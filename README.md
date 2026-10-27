@@ -59,8 +59,11 @@ CarousellCollector.exe --root D:\materials --urls URL --watch-daily 09:00  # 每
 
 ```
 {root}/
-├── 素材保存表格.xlsx     # 12 列模板：SKU/BrowserID/ProductNameCn/ProductNameEn/
+├── 素材保存表格.xlsx     # 12 列：SKU/BrowserID/ProductNameCn/ProductNameEn/
 │                        #   GenderEn/HKPrice/SGPrice/MYPrice/Brand/Folder/ShopID/Desc
+│                        #   版式对齐「最干净的上品记录/001/测试.xlsx」：
+│                        #   等线 12、表头行高 22、A1:L1 自动筛选、不冻结窗格；
+│                        #   SKU 与价格写数值；旧版式文件首次打开会自动迁移
 ├── {listing_id}/        # 每 SKU 一个目录（如 1470110967/）
 │   ├── {sku}_01.jpg     # 图片按序号命名
 │   └── …
