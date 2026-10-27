@@ -20,6 +20,7 @@ from typing import Optional
 from app import __version__
 from app.engine import CollectorEngine
 from app.link_library import LinkLibrary
+from app.proxy_pool import STRATEGIES, ProxyPool, mask_proxy
 from app.title_rules import TitleRules
 
 # ---------- 设计 token（深色科技风） ----------
@@ -272,6 +273,7 @@ class App:
         self.sched = None
         self.library = LinkLibrary()
         self.tstore = TitleRules(log=self.log)
+        self.ppool = ProxyPool(log=self.log)
         self._stats_vars: dict[str, tk.StringVar] = {}
         self._setup_ttk()
         self._build()
@@ -360,7 +362,7 @@ class App:
         holder = tk.Frame(self.root, bg=C_BG)
         holder.pack(fill="both", expand=True, padx=22, pady=(10, 0))
 
-        for key, text in (("collect", "采集"), ("library", "链接库")):
+        for key, text in (("collect", "采集"), ("library", "链接库"), ("pool", "IP 池")):
             wrap = tk.Frame(bar, bg=C_BG)
             wrap.pack(side="left", padx=(0, 22))
             lab = tk.Label(wrap, text=text, bg=C_BG, fg=C_FG_DIM, font=FONT_TABS,
@@ -375,6 +377,7 @@ class App:
 
         self._build_collect(self._pages["collect"])
         self._build_library(self._pages["library"])
+        self._build_pool(self._pages["pool"])
         self._switch_tab("collect")
 
     def _switch_tab(self, key: str):
@@ -588,7 +591,9 @@ class App:
                 page.pack_forget()
                 self._rules_tabs[k].configure(fg=C_FG_DIM)
                 self._rules_marks[k].configure(bg=C_CARD)
-        if key == "title":
+        if key == "pool":
+            self._render_pool()
+        elif key == "title":
             self._render_title_rules()
         elif getattr(self, "fstore", None) is not None:
             self._render_cats()
@@ -749,6 +754,187 @@ class App:
 
         self.tree.bind("<Double-1>", self._lib_row_dblclick)
         self._render_library()
+
+    # ---------------- IP 池页 ----------------
+
+    def _build_pool(self, parent):
+        wrap = tk.Frame(parent, bg=C_BG)
+        wrap.pack(fill="both", expand=True)
+        wrap.columnconfigure(0, weight=1)
+        wrap.rowconfigure(0, weight=1)
+
+        card = Card(wrap, "代理池", f"全局配置 {self.ppool.path}")
+        card.grid(row=0, column=0, sticky="nsew")
+
+        bar = tk.Frame(card.body, bg=C_CARD)
+        bar.pack(fill="x")
+        self.var_pool_on = tk.BooleanVar(value=self.ppool.enabled)
+        tk.Checkbutton(bar, text="启用", variable=self.var_pool_on, command=self._toggle_pool,
+                       bg=C_CARD, fg=C_FG, font=FONT, selectcolor=C_MUTED_BG,
+                       activebackground=C_CARD, activeforeground=C_FG,
+                       highlightthickness=0, bd=0).pack(side="left")
+        field_label(bar, "轮换策略").pack(side="left", padx=(14, 6))
+        self.var_pool_strategy = tk.StringVar(value=STRATEGIES.get(self.ppool.strategy, "轮询"))
+        cb = ttk.Combobox(bar, textvariable=self.var_pool_strategy,
+                          values=list(STRATEGIES.values()), width=9,
+                          state="readonly", font=FONT)
+        cb.pack(side="left")
+        cb.bind("<<ComboboxSelected>>", lambda e: self._pool_strategy_changed())
+        field_label(bar, "每 IP 请求数").pack(side="left", padx=(14, 6))
+        self.var_pool_rpi = tk.StringVar(value=str(self.ppool.requests_per_ip))
+        sp = ttk.Spinbox(bar, from_=20, to=5000, increment=20,
+                         textvariable=self.var_pool_rpi, width=6, font=FONT,
+                         command=self._pool_rpi_changed)
+        sp.pack(side="left")
+        sp.bind("<FocusOut>", lambda e: self._pool_rpi_changed())
+        self.lbl_pool_count = tk.Label(bar, text="", bg=C_CARD, fg=C_FG_DIM, font=FONT_MONO_SM)
+        self.lbl_pool_count.pack(side="right")
+
+        table = tk.Frame(card.body, bg=C_CARD)
+        table.pack(fill="both", expand=True, pady=(12, 0))
+        table.columnconfigure(0, weight=1)
+        table.rowconfigure(0, weight=1)
+        cols = ("label", "url", "state", "used", "fails", "last", "test")
+        heads = ("标签", "代理", "状态", "已用", "失败", "最近使用", "上次测试")
+        widths = (90, 300, 100, 70, 70, 140, 150)
+        self.tree_pool = ttk.Treeview(table, columns=cols, show="headings", height=9)
+        for c, h, w in zip(cols, heads, widths):
+            self.tree_pool.heading(c, text=h)
+            self.tree_pool.column(c, width=w,
+                                  anchor="w" if c in ("url", "last", "test") else "center")
+        vsb = SlimScrollbar(table, self.tree_pool)
+        self.tree_pool.configure(yscrollcommand=vsb.set)
+        self.tree_pool.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns", padx=(6, 6), pady=6)
+
+        foot = tk.Frame(card.body, bg=C_CARD)
+        foot.pack(fill="x", pady=(10, 0))
+        btn(foot, "测试选中", self._pool_test, "outline").pack(side="left")
+        btn(foot, "启用 / 停用", self._pool_toggle, "ghost").pack(side="left", padx=8)
+        btn(foot, "删除选中", self._pool_del, "ghost").pack(side="left")
+        btn(foot, "立即轮换", self._pool_rotate_now, "secondary").pack(side="left", padx=8)
+        btn(foot, "清空统计", self._pool_clear, "ghost").pack(side="left")
+
+        imp = Card(wrap, "批量导入", "每行一条：host:port:user:pass（可带 http:// 或 socks5:// 前缀）")
+        imp.grid(row=1, column=0, sticky="ew", pady=(14, 0))
+        self.txt_proxies = tk.Text(imp.body, height=3, wrap="char", font=FONT_MONO,
+                                   relief="flat", bd=0, bg=C_MUTED_BG, fg=C_FG,
+                                   insertbackground=C_ACCENT, insertwidth=2,
+                                   highlightthickness=1, highlightbackground=C_BORDER,
+                                   highlightcolor=C_ACCENT, padx=10, pady=8)
+        self.txt_proxies.pack(fill="x")
+        ibar = tk.Frame(imp.body, bg=C_CARD)
+        ibar.pack(fill="x", pady=(10, 0))
+        btn(ibar, "导入", self._pool_import, "default").pack(side="left")
+        btn(ibar, "从剪贴板粘贴", self._pool_paste, "outline").pack(side="left", padx=8)
+        self.lbl_pool_hint = tk.Label(ibar, text="", bg=C_CARD, fg=C_FG_FAINT, font=FONT_MONO_SM)
+        self.lbl_pool_hint.pack(side="right")
+        self._render_pool()
+
+    def _render_pool(self):
+        import time as _t
+        now = _t.time()
+        for iid in self.tree_pool.get_children():
+            self.tree_pool.delete(iid)
+        items = self.ppool.proxies()
+        for i, p in enumerate(items):
+            if not p.get("enabled", True):
+                state = "○ 停用"
+            elif p.get("cooldown_until", 0) > now:
+                state = f"⏸ {int((p['cooldown_until'] - now) / 60) + 1}m"
+            else:
+                state = "● 可用"
+            self.tree_pool.insert("", "end", iid=str(i), values=(
+                p.get("label") or f"IP{i + 1}",
+                mask_proxy(p.get("url", "")),
+                state,
+                p.get("used", 0),
+                p.get("fails", 0),
+                p.get("last_used") or "—",
+                p.get("last_test") or "—",
+            ))
+        self.lbl_pool_count.configure(
+            text=f"{len(items)} 个出口 · 可用 {self.ppool.available_count()}")
+
+    def _pool_sel_index(self):
+        sel = self.tree_pool.selection()
+        return int(sel[0]) if sel else None
+
+    def _toggle_pool(self):
+        self.ppool.set_enabled(self.var_pool_on.get())
+        self._render_pool()
+
+    def _pool_strategy_changed(self):
+        label = self.var_pool_strategy.get()
+        key = next((k for k, v in STRATEGIES.items() if v == label), "round_robin")
+        self.ppool.set_strategy(key)
+
+    def _pool_rpi_changed(self):
+        try:
+            self.ppool.set_requests_per_ip(int(self.var_pool_rpi.get()))
+        except (TypeError, ValueError):
+            self.var_pool_rpi.set(str(self.ppool.requests_per_ip))
+
+    def _pool_import(self):
+        raw = self.txt_proxies.get("1.0", "end").splitlines()
+        urls = [l.strip() for l in raw if l.strip() and not l.strip().startswith("#")]
+        if not urls:
+            return
+        added = self.ppool.add(urls)
+        self.txt_proxies.delete("1.0", "end")
+        self.lbl_pool_hint.configure(text=f"新增 {added} 个出口")
+        self._render_pool()
+
+    def _pool_paste(self):
+        try:
+            text = self.root.clipboard_get()
+        except Exception:
+            return
+        self.txt_proxies.insert("end", ("\n" if self.txt_proxies.get("1.0", "end").strip() else "") + text)
+
+    def _pool_toggle(self):
+        i = self._pool_sel_index()
+        if i is not None:
+            self.ppool.toggle(i)
+            self._render_pool()
+
+    def _pool_del(self):
+        i = self._pool_sel_index()
+        if i is not None:
+            self.ppool.remove(i)
+            self._render_pool()
+
+    def _pool_clear(self):
+        if messagebox.askyesno("清空统计", "把已用/失败/冷却全部归零？"):
+            self.ppool.clear_stats()
+            self._render_pool()
+
+    def _pool_rotate_now(self):
+        self.ppool.request_rotation()
+        self.log("[IP] 已请求立即轮换（下一批生效）")
+
+    def _pool_test(self):
+        i = self._pool_sel_index()
+        if i is None:
+            return
+        url = self.ppool.proxies()[i]["url"]
+
+        def work():
+            ok, note = False, ""
+            try:
+                from curl_cffi import requests as creq
+                r = creq.get("https://api.ipify.org?format=json",
+                             proxies={"http": url, "https": url}, timeout=12)
+                note = (r.json() or {}).get("ip", "") or ""
+                ok = bool(note)
+            except Exception as e:
+                note = type(e).__name__
+            self.ppool.set_proxy_status(i, ok, note)
+            self.log(f"[IP] {mask_proxy(url)} → {'出口 ' + note if ok else '测试失败 ' + note}")
+            self.root.after(0, self._render_pool)
+
+        self.log(f"[IP] 正在测试 {mask_proxy(url)} …")
+        threading.Thread(target=work, daemon=True).start()
 
     # ---------------- library ----------------
 
@@ -986,6 +1172,7 @@ class App:
                                       max_items=max_items, path_style=path_style)
         self.engine.filters = self.fstore
         self.engine.title_rules = self.tstore
+        self.engine.pool = self.ppool
 
         def work():
             try:

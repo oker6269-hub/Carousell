@@ -25,7 +25,9 @@ TLS/UA 指纹绑定，导出给 curl 复用必然被判无效 —— 所以不�
 - 浏览器既做枚举也做取数，全程一个身份，**不存在第二个客户端**
 - 只有图片走 curl（CDN 无 CF 防护）
 - 默认**直连免代理**；代理可选（GUI/CLI 配置）
-- 反爬应对：详情按批并发 + 批次间隔、失败重试（指数退避）、profile 损坏自动隔离重建
+- 反爬应对：详情按批并发 + 批次间隔、失败重试；命中站点限流（HTTP 499/403/429/挑战页）
+  会暂停降温并重载页面刷新 clearance，仍不恢复则提前结束本次采集（下次重跑从剩余 SKU 继续）
+- profile 损坏自动隔离重建
 - 规模参考（实测）：详情抓取约 4 条/秒；瓶颈是图片（每 SKU 4 并发）。
   3500 个商品、每 SKU 6 张图，整体约 2-3 小时；调大 `--workers` 可线性缩短下图时间
 
@@ -41,7 +43,7 @@ TLS/UA 指纹绑定，导出给 curl 复用必然被判无效 —— 所以不�
 ## 使用（CLI）
 
 ```bash
-CarousellCollector.exe --root D:\materials --urls https://www.carousell.com.hk/u/xxx/ [--workers 4] [--detail-concurrency 4] [--max-items 5000] [--proxy socks5://127.0.0.1:1080]
+CarousellCollector.exe --root D:\materials --urls https://www.carousell.com.hk/u/xxx/ [--workers 4] [--detail-concurrency 2] [--detail-delay 0.8] [--max-items 5000] [--proxy socks5://127.0.0.1:1080]
 # 定时自动更新（增量拉新品）
 CarousellCollector.exe --root D:\materials --urls URL --watch 60          # 每 60 分钟
 CarousellCollector.exe --root D:\materials --urls URL --watch-daily 09:00  # 每天 09:00
@@ -126,6 +128,46 @@ python tools/fix_titles.py /Users/max/carousell/新品采集10_25            # �
 python tools/fix_titles.py /Users/max/carousell/新品采集10_25 --apply    # 写入
 ```
 
+## 动态 IP 池（按段轮换）
+
+站点会在**请求量过大时整段封禁 IP**（实测：4 并发跑约 270 条后开始返回 `HTTP 499`，
+之后连正常打开页面都过不了验证，持续 30 分钟以上）。配好 IP 池后，程序按「段」轮换出口：
+
+```
+枚举/取详情（同一个浏览器）
+   └─ 每发够 N 条详情请求 → 关掉浏览器 → 换下一个代理重启 → 回到卖家页重新验证 → 继续
+   └─ 一旦被站点拒绝（499/403/429/挑战页）→ 立刻换 IP 重试同一批，而不是干等
+```
+
+> 为什么不是「每个请求换 IP」：`cf_clearance` 与出口 IP 绑定，换 IP 后必须重新过验证，
+> 每请求轮换等于每条都卡在验证上。所以是**按段**轮换（默认 200 条一段）。
+
+配置：`~/.carousell-collector/proxies.json`（全局），也可以在 GUI 的 **IP 池** 页签里管理。
+
+```json
+{
+  "enabled": true,
+  "strategy": "round_robin",      // round_robin 轮询 | random 随机 | least_used 最少使用
+  "requests_per_ip": 200,         // 单个 IP 发够多少条详情后轮换
+  "cooldown_minutes": 10,         // 被站点拒绝的 IP 冷却多久
+  "proxies": [
+    {"label": "HK-01", "url": "http://user:pass@sg.example.com:443", "enabled": true}
+  ]
+}
+```
+
+- 导入格式（一行一条）：`host:port:user:pass`（代理商常见导出格式）、`host:port`、
+  `http://user:pass@host:port`、`socks5://user:pass@host:port`
+- Chrome 的 `--proxy-server` 不支持带账号密码（会报 `ERR_NO_SUPPORTED_PROXIES`），
+  程序会在本机起一个**本地转发**（`127.0.0.1` 随机端口）自动补 `Proxy-Authorization`，
+  Chrome 只看到无认证的本地代理，无需手工配置
+- GUI → **IP 池** 页签：启用开关、策略、每 IP 请求数、批量导入（每行一个）、
+  测试出口（显示真实出口 IP）、启停/删除、清空统计、立即轮换
+- 三种策略：`轮询`（按列表顺序）、`随机`、`最少使用`（优先用请求数最少的，负载均衡）
+- 被拒绝的出口自动进入冷却，轮换时跳过；全部不可用则**提前结束并保留断点**，下次重跑继续
+- 池子启用时优先于 `--proxy`；都没配就是直连
+- 每次轮换的代价：重启浏览器 + 重新过验证（约 5–20 秒）。3500 条按 200/段 ≈ 18 次 ≈ 6–9 分钟
+
 ## 断点 / 增量 / 定时更新
 
 ### 三轮去重（互不依赖，任一满足即跳过）
@@ -201,7 +243,9 @@ git tag v1.0.2 && git push origin v1.0.2
 ## 注意
 
 - 首次运行 Chrome 窗口会自动通过 CF 验证；若弹人机验证，手动点击一次即可（60 秒宽限）
-- 详情默认 4 条一批并发（`--detail-concurrency` 可调）、批间隔 0.6s（`--workers` 控图片并发）；
-  大量 SKU 时请勿盲目调高，先小批量观察是否触发风控
+- 详情默认 **2 条一批**、批间隔 0.8s（`--detail-concurrency` / `--detail-delay` 可调）。
+  实测并发 4、间隔 0 时，站点会在约 270 个请求后开始返回 **HTTP 499** 并临时封禁整段 IP，
+  连正常打开页面都会失败；调高之前先小批量试，看到 `[限流]` 日志就调回或调慢
+- `--workers` 只控图片并发（走 CDN，不受该限流影响）
 - cf_clearance 与客户端指纹绑定：换网络环境后首跑需重新过验证（自动）
 - profile 若损坏（内核启动即崩），程序会自动改名隔离并用全新 profile 重建，日志里会写明路径

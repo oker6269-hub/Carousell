@@ -13,6 +13,7 @@
 import atexit
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -68,17 +69,30 @@ _FETCH_LISTINGS_JS = r"""
     }
     return null;
   };
+  const reasonOf = (status, html) => {
+    if (status === 0) return 'net';
+    if (status !== 200) return 'http' + status;
+    const head = html.slice(0, 5000).toLowerCase();
+    if (head.includes('just a moment') || head.includes('cf-chl') ||
+        html.slice(0, 5000).includes('请稍候') || html.slice(0, 5000).includes('請稍候') ||
+        html.slice(0, 5000).includes('安全验证') || html.slice(0, 5000).includes('安全驗證')) {
+      return 'challenge';
+    }
+    return 'ok';
+  };
   const out = [];
   await Promise.all(urls.map(async (u) => {
     try {
       const resp = await fetch(u, {credentials: 'include'});
-      if (resp.status !== 200) { out.push({path: u, status: resp.status, d: null}); return; }
-      const st = grabState(await resp.text());
+      const html = await resp.text();
+      const reason = reasonOf(resp.status, html);
+      if (reason !== 'ok') { out.push({path: u, status: resp.status, reason, d: null}); return; }
+      const st = grabState(html);
       const map = st && st.Listing && st.Listing.listingsMap;
-      if (!map) { out.push({path: u, status: resp.status, d: null}); return; }
+      if (!map) { out.push({path: u, status: resp.status, reason: 'no_state', d: null}); return; }
       const L = map[Object.keys(map)[0]] || {};
       const attrs = L.listing_attributes || {};
-      out.push({path: u, status: resp.status, d: {
+      out.push({path: u, status: resp.status, reason: 'ok', d: {
         id: String(L.id || ''),
         title: L.title || '',
         desc: L.flattened_description || L.description || '',
@@ -89,7 +103,7 @@ _FETCH_LISTINGS_JS = r"""
         images: (L.photos || []).map(p => p && p.image_url).filter(Boolean)
       }});
     } catch (e) {
-      out.push({path: u, status: 0, d: null});
+      out.push({path: u, status: 0, reason: 'net', d: null});
     }
   }));
   return JSON.stringify(out);
@@ -121,6 +135,8 @@ class BrowserSession:
         self._proc: Optional[subprocess.Popen] = None
         self._errlog = None
         self._recovered = False
+        self.blocked_reason: Optional[str] = None
+        self._relay = None
         self._port = 0
         self._temp_profile: Optional[str] = None
 
@@ -176,7 +192,12 @@ class BrowserSession:
             self.log(f"[浏览器] {'Chrome' if self.browser_kind == 'chrome' else 'Edge'} 内核"
                      + ("（建议安装 CloakBrowser 提升反检测能力）" if self.browser_kind != "cloak" else ""))
         if self.proxy:
-            cmd.append(f"--proxy-server={self.proxy}")
+            from .proxy_relay import ensure_local_proxy
+            proxy_url, relay = ensure_local_proxy(self.proxy, log=self.log)
+            if relay is not None:
+                self._relay = relay
+                self.log(f"[IP] 本地转发已就绪 → {self.proxy.split('@')[-1]}")
+            cmd.append(f"--proxy-server={proxy_url}")
         cmd.append(url)
         # POSIX：独立会话，便于整组回收（Chrome 会派生多个子进程）
         kwargs = {"start_new_session": True} if os.name == "posix" else {}
@@ -303,6 +324,12 @@ class BrowserSession:
                 except Exception:
                     pass
         self._kill_stale()
+        if self._relay is not None:
+            try:
+                self._relay.stop()
+            except Exception:
+                pass
+            self._relay = None
         if self._errlog is not None:
             try:
                 self._errlog.close()
@@ -519,33 +546,149 @@ class BrowserSession:
         except Exception:
             return False
 
-    def fetch_listings(self, urls: list[str], timeout: float = 150.0) -> dict[str, dict]:
+    # 可以重试的失败原因（404 这类重试无意义）
+    RETRYABLE = {"challenge", "http429", "http503", "http499", "http403", "net", "no_state"}
+    # 站点限流/风控信号：命中后必须停下来降温，硬撑只会把整段 IP 拉黑
+    BLOCKED = {"challenge", "http429", "http403", "http503", "http499"}
+
+    def fetch_listings(self, urls: list[str], timeout: float = 150.0,
+                       retries: int = 1, retry_delay: float = 3.0,
+                       cooldown: tuple = (60, 180, 300)) -> dict[str, dict]:
         """在页面上下文里并发 fetch 详情页，返回 {url: 精简 listing 字段}。
 
-        单一客户端原则：请求由浏览器自己发出，cookie/UA/TLS 天然一致，
-        不再把 cf_clearance 导出给另一个客户端复用（那是设计上的错）。
-        并发由 JS 的 Promise.all 完成，一批几条由调用方决定。
+        单一客户端原则：请求由浏览器自己发出，cookie/UA/TLS 天然一致。
+        失败会带原因（challenge / http404 / http499 …）并按批汇总写日志。
+        命中站点限流（499/403/429/challenge）时先冷却降温、重载页面再试，
+        连续降温仍不恢复就置 blocked_reason，交由上层中止本次采集。
         """
+        self.blocked_reason = None
+        if not urls:
+            return {}
         page = self._page()
         if not page:
+            self.log("[详情] 找不到可用的浏览器页面，放弃本批抓取")
             return {}
+
+        out: dict[str, dict] = {}
+        pending = list(urls)
+        failed: list[dict] = []
+        for attempt in range(retries + 1):
+            rows = self._fetch_rows(page, pending, timeout)
+            failed = []
+            for row in rows:
+                if isinstance(row, dict) and row.get("d"):
+                    out[row.get("path") or ""] = row["d"]
+                else:
+                    failed.append(row if isinstance(row, dict) else {"path": "", "reason": "bad"})
+            if not failed:
+                break
+            reasons = {r.get("reason") for r in failed}
+            # 整批都被站点拒绝 → 不是个别商品的问题，进入冷却
+            if reasons and reasons <= self.BLOCKED:
+                recovered = self._cool_down_and_retry(out, failed, pending, page,
+                                                      timeout, cooldown)
+                if not recovered:
+                    self.blocked_reason = next(iter(reasons))
+                    failed = [r for r in failed if r.get("path") not in out]
+                    break
+                failed = [r for r in failed if r.get("path") not in out]
+                if not failed:
+                    break
+                pending = [r.get("path") for r in failed if r.get("path")]
+                if not pending:
+                    break
+                continue
+            retryable = [r for r in failed if r.get("reason") in self.RETRYABLE]
+            if attempt >= retries or not retryable:
+                break
+            pending = [r.get("path") for r in retryable if r.get("path")]
+            if not pending:
+                break
+            self.log(f"[详情] {len(failed)} 条失败（{self._reason_summary(failed)}），"
+                     f"{retry_delay:.0f}s 后重试 {len(pending)} 条")
+            time.sleep(retry_delay)
+
+        if failed and not self.blocked_reason:
+            self.log(f"[详情] 本批 {len(failed)}/{len(urls)} 失败：{self._reason_summary(failed)}"
+                     + self._sample_skus(failed))
+        return out
+
+    def _cool_down_and_retry(self, out: dict, failed: list[dict], pending: list[str],
+                             page: dict, timeout: float, cooldown: tuple) -> bool:
+        """站点限流的降温循环：暂停 → 重载页面刷新 clearance → 重试。"""
+        reason = self._reason_summary(failed)
+        for i, wait in enumerate(cooldown, 1):
+            self.log(f"[限流] 站点拒绝（{reason}），暂停 {wait}s 降温后重试"
+                     f"（{i}/{len(cooldown)}）")
+            if not self._sleep_interruptible(wait):
+                self.log("[限流] 用户停止，退出冷却")
+                return False
+            self._reload_page(page)
+            time.sleep(2)
+            rows = self._fetch_rows(page, pending, timeout)
+            for row in rows:
+                if isinstance(row, dict) and row.get("d"):
+                    out[row.get("path") or ""] = row["d"]
+            left = [r for r in pending if r not in out]
+            if not left:
+                self.log("[限流] 已恢复，继续采集")
+                return True
+            failed = [r for r in rows if not r.get("d")]
+            reason = self._reason_summary(failed)
+        return False
+
+    def _reload_page(self, page: dict):
+        """重载当前页面：重新走一次 CF 校验，拿到新的 cf_clearance。"""
+        try:
+            cdp = _CDP(page["webSocketDebuggerUrl"])
+            try:
+                cdp.call("Page.enable", timeout=10)
+                cdp.call("Page.reload", {"ignoreCache": True}, timeout=15)
+            finally:
+                cdp.close()
+            self._wait_ready(60)
+        except Exception as e:
+            self.log(f"[限流] 页面重载失败: {e}")
+
+    def _sleep_interruptible(self, seconds: float) -> bool:
+        """可中断睡眠；用户点了停止就返回 False。"""
+        end = time.time() + max(0.0, seconds)
+        while time.time() < end:
+            if self._stop_requested():
+                return False
+            time.sleep(min(0.5, max(0.0, end - time.time())))
+        return True
+
+    def _fetch_rows(self, page: dict, urls: list[str], timeout: float) -> list[dict]:
         cdp = _CDP(page["webSocketDebuggerUrl"])
         try:
             js = _FETCH_LISTINGS_JS.replace("__URLS__", json.dumps(urls, ensure_ascii=False))
             res = cdp.call("Runtime.evaluate",
                            {"expression": js, "awaitPromise": True, "returnByValue": True},
                            timeout=timeout)
-            rows = json.loads(res.get("result", {}).get("value") or "[]")
+            return json.loads(res.get("result", {}).get("value") or "[]")
         except Exception as e:
-            self.log(f"[浏览器] 详情抓取失败: {e}")
-            return {}
+            self.log(f"[详情] CDP 抓取异常: {e}")
+            return [{"path": u, "reason": "cdp", "d": None} for u in urls]
         finally:
             cdp.close()
-        out: dict[str, dict] = {}
-        for row in rows:
-            if isinstance(row, dict) and row.get("d"):
-                out[row.get("path") or ""] = row["d"]
-        return out
+
+    @staticmethod
+    def _reason_summary(rows: list[dict]) -> str:
+        counts: dict[str, int] = {}
+        for r in rows:
+            counts[str(r.get("reason") or "?")] = counts.get(str(r.get("reason") or "?"), 0) + 1
+        return "、".join(f"{k}×{v}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1]))
+
+    @staticmethod
+    def _sample_skus(rows: list[dict], n: int = 3) -> str:
+        ids = []
+        for r in rows:
+            path = str(r.get("path") or "")
+            m = re.search(r"-(\d{6,})/?$", path.rstrip("/"))
+            if m:
+                ids.append(m.group(1))
+        return ("；例 " + "、".join(ids[:n])) if ids else ""
 
     def collect_sellers(self, urls: list[str], max_items: int = 5000,
                         log_progress: Optional[Callable[[int, int, str], None]] = None) -> dict:

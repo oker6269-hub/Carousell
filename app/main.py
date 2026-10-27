@@ -74,7 +74,8 @@ def run_cli(args) -> int:
     def run_once() -> dict:
         engine = CollectorEngine(args.root, log=log, proxy=args.proxy, img_workers=args.workers,
                                  max_items=getattr(args, "max_items", 5000),
-                                 detail_concurrency=getattr(args, "detail_concurrency", 4),
+                                 detail_concurrency=getattr(args, "detail_concurrency", 2),
+                                 detail_delay=getattr(args, "detail_delay", 0.8),
                                  path_style=getattr(args, "path_style", "native"))
         _holder["engine"] = engine
         try:
@@ -117,8 +118,10 @@ def main():
     parser.add_argument("--urls", nargs="+", help="卖家链接（可多条）")
     parser.add_argument("--proxy", default="", help="可选代理 socks5://host:port")
     parser.add_argument("--workers", type=int, default=4, help="图片下载并发（默认 4）")
-    parser.add_argument("--detail-concurrency", type=int, default=4, dest="detail_concurrency",
-                        metavar="N", help="详情页批量并发（默认 4，浏览器内 Promise.all）")
+    parser.add_argument("--detail-concurrency", type=int, default=2, dest="detail_concurrency",
+                        metavar="N", help="详情页批量并发（默认 2；太高容易被站点限流）")
+    parser.add_argument("--detail-delay", type=float, default=0.8, dest="detail_delay",
+                        metavar="SEC", help="详情批次间隔秒数（默认 0.8）")
     parser.add_argument("--max-items", type=int, default=5000, dest="max_items",
                         help="每个卖家最多枚举商品数（默认 5000）")
     parser.add_argument("--path-style", default="native", choices=["native", "posix", "relative"],
