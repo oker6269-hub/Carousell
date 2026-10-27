@@ -16,6 +16,7 @@ from .http_client import ImageFetcher, StopRequested
 from .parser import detail_from_listing, parse_link_kind, parse_listing_id_from_url
 from .rules import infer_brand, infer_gender
 from .storage import ExcelStore, FilterStore, StateStore
+from .title_rules import TitleRules
 from .link_library import LinkLibrary
 
 BASE = "https://www.carousell.com.hk"
@@ -40,6 +41,8 @@ class CollectorEngine:
 
         self.state = StateStore(str(self.root / "state.json"))
         self.filters = FilterStore(str(self.root / "filters.json"))
+        # 标题清洗（全局配置，CLI 与 GUI 共用同一份）
+        self.title_rules = TitleRules(log=log)
         self.excel = ExcelStore(str(self.root), log=log)
         # 浏览器 profile 固定放共享目录：指纹身份稳定，二次运行免重复过人机验证
         self.profile_dir = Path.home() / ".carousell-collector" / "chrome-profile"
@@ -242,7 +245,10 @@ class CollectorEngine:
     def _save_sku(self, sku: str, detail: dict, seller: str, pending_excel: list[dict]):
         if not sku:
             raise RuntimeError("缺少 listing id")
-        title = detail["name"]
+        raw_title = detail["name"]
+        title = self.title_rules.clean(raw_title)
+        if title != raw_title:
+            self.log(f"[标题] {sku} 清洗: {raw_title[:40]} → {title[:40]}")
         category = detail["category"]
         price = detail["price"]
         if not seller:

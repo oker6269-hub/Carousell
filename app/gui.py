@@ -20,6 +20,7 @@ from typing import Optional
 from app import __version__
 from app.engine import CollectorEngine
 from app.link_library import LinkLibrary
+from app.title_rules import TitleRules
 
 # ---------- 设计 token（深色科技风） ----------
 C_BG = "#0A101C"          # 窗口底
@@ -270,6 +271,7 @@ class App:
         self.worker: Optional[threading.Thread] = None
         self.sched = None
         self.library = LinkLibrary()
+        self.tstore = TitleRules(log=self.log)
         self._stats_vars: dict[str, tk.StringVar] = {}
         self._setup_ttk()
         self._build()
@@ -541,10 +543,57 @@ class App:
             self.txt_log.tag_config(tag, foreground=fg)
         self.txt_log.tag_config("phase", font=(FONT_MONO[0], 12, "bold"))
 
-        # 卡3 类目过滤
-        c3 = Card(right_col, "类目跳过", "持久化在根路径 filters.json")
-        c3.pack(fill="x", pady=(14, 0))
-        b = c3.body
+        # 规则面板：类目跳过 / 标题清洗（子页签，省纵向空间）
+        panel = tk.Frame(right_col, bg=C_CARD, highlightbackground=C_BORDER,
+                         highlightthickness=1)
+        panel.pack(fill="x", pady=(14, 0))
+        phead = tk.Frame(panel, bg=C_CARD)
+        phead.pack(fill="x", padx=18, pady=(12, 0))
+        tk.Frame(phead, bg=C_ACCENT, width=3, height=16).pack(side="left", padx=(0, 9))
+        self._rules_tabs = {}
+        self._rules_marks = {}
+        for key, text in (("cats", "类目跳过"), ("title", "标题清洗")):
+            wrap = tk.Frame(phead, bg=C_CARD)
+            wrap.pack(side="left", padx=(0, 12))
+            lab = tk.Label(wrap, text=text, bg=C_CARD, fg=C_FG_DIM, font=FONT_BOLD,
+                           cursor="hand2", padx=2, pady=2)
+            lab.pack()
+            mark = tk.Frame(wrap, bg=C_CARD, height=2)
+            mark.pack(fill="x", pady=(3, 0))
+            lab.bind("<Button-1>", lambda e, k=key: self._switch_rules(k))
+            self._rules_tabs[key] = lab
+            self._rules_marks[key] = mark
+
+        pbody = tk.Frame(panel, bg=C_CARD)
+        pbody.pack(fill="both", expand=True, padx=18, pady=(8, 14))
+        self._rules_pages = {k: tk.Frame(pbody, bg=C_CARD) for k in ("cats", "title")}
+        self._build_cats_page(self._rules_pages["cats"])
+        self._build_title_page(self._rules_pages["title"])
+        self._switch_rules("cats")
+
+    def _stat_tile(self, parent, label, key, color):
+        tile = StatTile(parent, label, color)
+        tile.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self._stats_vars[key] = tile.var
+
+    # ---------------- 规则：类目 / 标题 ----------------
+
+    def _switch_rules(self, key: str):
+        for k, page in self._rules_pages.items():
+            if k == key:
+                page.pack(fill="both", expand=True)
+                self._rules_tabs[k].configure(fg=C_FG)
+                self._rules_marks[k].configure(bg=C_ACCENT)
+            else:
+                page.pack_forget()
+                self._rules_tabs[k].configure(fg=C_FG_DIM)
+                self._rules_marks[k].configure(bg=C_CARD)
+        if key == "title":
+            self._render_title_rules()
+        elif getattr(self, "fstore", None) is not None:
+            self._render_cats()
+
+    def _build_cats_page(self, b):
         b.columnconfigure(1, weight=1)
         self.var_skip_on = tk.BooleanVar(value=True)
         tk.Checkbutton(b, text="启用", variable=self.var_skip_on,
@@ -562,17 +611,88 @@ class App:
                                    highlightthickness=1, highlightbackground=C_BORDER,
                                    activestyle="none", selectborderwidth=0,
                                    borderwidth=0)
-        self.lst_cats.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        self.lst_cats.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(10, 0))
 
-        fbtns = tk.Frame(b, bg=C_CARD)
-        fbtns.grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
-        btn(fbtns, "开 / 关", self._toggle_cat, "ghost").pack(side="left")
-        btn(fbtns, "删除", self._del_cat, "ghost").pack(side="left", padx=8)
+        foot = tk.Frame(b, bg=C_CARD)
+        foot.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        btn(foot, "开 / 关", self._toggle_cat, "ghost").pack(side="left")
+        btn(foot, "删除", self._del_cat, "ghost").pack(side="left", padx=8)
+        tk.Label(foot, text="filters.json", bg=C_CARD, fg=C_FG_FAINT,
+                 font=FONT_MONO_SM).pack(side="right")
 
-    def _stat_tile(self, parent, label, key, color):
-        tile = StatTile(parent, label, color)
-        tile.pack(side="left", fill="x", expand=True, padx=(0, 10))
-        self._stats_vars[key] = tile.var
+    def _build_title_page(self, b):
+        b.columnconfigure(1, weight=1)
+        self.var_title_on = tk.BooleanVar(value=self.tstore.enabled)
+        tk.Checkbutton(b, text="启用", variable=self.var_title_on,
+                       command=self._toggle_title_on, bg=C_CARD, fg=C_FG, font=FONT,
+                       selectcolor=C_MUTED_BG, activebackground=C_CARD,
+                       activeforeground=C_FG, highlightthickness=0,
+                       bd=0).grid(row=0, column=0, sticky="w")
+        self.var_title_pattern = tk.StringVar()
+        entry(b, self.var_title_pattern, font=FONT_MONO).grid(
+            row=0, column=1, sticky="ew", padx=8, ipady=5)
+        tk.Label(b, text="→", bg=C_CARD, fg=C_FG_DIM, font=FONT).grid(row=0, column=2)
+        self.var_title_replace = tk.StringVar()
+        entry(b, self.var_title_replace, width=6).grid(row=0, column=3, padx=(6, 8), ipady=5)
+        btn(b, "添加", self._add_title_rule, "outline").grid(row=0, column=4)
+
+        self.lst_title = tk.Listbox(b, height=3, font=FONT_MONO_SM, relief="flat", bd=0,
+                                    bg=C_MUTED_BG, fg=C_FG,
+                                    selectbackground=C_ACCENT_DIM, selectforeground=C_FG,
+                                    highlightthickness=1, highlightbackground=C_BORDER,
+                                    activestyle="none", selectborderwidth=0,
+                                    borderwidth=0)
+        self.lst_title.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(10, 0))
+
+        foot = tk.Frame(b, bg=C_CARD)
+        foot.grid(row=2, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+        btn(foot, "开 / 关", self._toggle_title_rule, "ghost").pack(side="left")
+        btn(foot, "删除", self._del_title_rule, "ghost").pack(side="left", padx=8)
+        btn(foot, "恢复默认", self._reset_title_rules, "ghost").pack(side="left")
+        tk.Label(foot, text="title_rules.json", bg=C_CARD, fg=C_FG_FAINT,
+                 font=FONT_MONO_SM).pack(side="right")
+        self._render_title_rules()
+
+    def _render_title_rules(self):
+        self.lst_title.delete(0, "end")
+        for r in self.tstore.rules():
+            mark = "●" if r.get("enabled", True) else "○"
+            rep = f"  →  {r['replace']}" if r.get("replace") else ""
+            self.lst_title.insert("end", f"{mark} {r['pattern']}{rep}")
+        if hasattr(self, "var_title_on"):
+            self.var_title_on.set(self.tstore.enabled)
+
+    def _toggle_title_on(self):
+        self.tstore.set_enabled(self.var_title_on.get())
+
+    def _add_title_rule(self):
+        pat = self.var_title_pattern.get().strip()
+        rep = self.var_title_replace.get()
+        if not pat:
+            return
+        if not self.tstore.add(pat, rep):
+            messagebox.showwarning("正则无效", f"这条正则无法编译，已忽略：\n\n{pat}")
+            return
+        self.var_title_pattern.set("")
+        self.var_title_replace.set("")
+        self._render_title_rules()
+
+    def _toggle_title_rule(self):
+        sel = self.lst_title.curselection()
+        if sel:
+            self.tstore.toggle(sel[0])
+            self._render_title_rules()
+
+    def _del_title_rule(self):
+        sel = self.lst_title.curselection()
+        if sel:
+            self.tstore.remove(sel[0])
+            self._render_title_rules()
+
+    def _reset_title_rules(self):
+        if messagebox.askyesno("恢复默认", "将标题清洗规则恢复为内置默认值？"):
+            self.tstore.reset()
+            self._render_title_rules()
 
     # ---------------- 链接库页 ----------------
 
@@ -851,6 +971,7 @@ class App:
                                       proxy=proxy, img_workers=workers,
                                       max_items=max_items, path_style=path_style)
         self.engine.filters = self.fstore
+        self.engine.title_rules = self.tstore
 
         def work():
             try:
