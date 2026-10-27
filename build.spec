@@ -69,7 +69,7 @@ if IS_MAC:
         info_plist={
             "CFBundleName": "CarousellCollector",
             "CFBundleDisplayName": "Carousell 采集工具",
-            "CFBundleShortVersionString": "1.4.2",
+            "CFBundleShortVersionString": "1.5.0",
             "NSHighResolutionCapable": True,
             "LSMinimumSystemVersion": "11.0",
             "LSApplicationCategoryType": "public.app-category.utilities",
